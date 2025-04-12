@@ -1,6 +1,6 @@
 # ADAPTED from https://github.com/yl4579/StyleTTS2/blob/main/Modules/istftnet.py
 from kokoro.custom_stft import CustomSTFT
-from torch.nn.utils import weight_norm
+from torch.nn.utils.parametrizations import weight_norm
 import math
 import torch
 import torch.nn as nn
@@ -24,10 +24,9 @@ class AdaIN1d(nn.Module):
         self.norm = nn.InstanceNorm1d(num_features, affine=True)
         self.fc = nn.Linear(style_dim, num_features*2)
 
-    def forward(self, x, s):
-        h = self.fc(s)
-        h = h.view(h.size(0), h.size(1), 1)
-        gamma, beta = torch.chunk(h, chunks=2, dim=1)
+    def forward(self, x, s): # x: b x d_model x max_dur, s: b x 1 x sty_dim
+        h = self.fc(s).transpose(1,2) # b x (2*d_model) x 1
+        gamma, beta = torch.chunk(h, chunks=2, dim=1).expand(-1, -1, x.shape[2]) # b x d_model x max_dur
         return (1 + gamma) * self.norm(x) + beta
 
 
@@ -296,7 +295,7 @@ class Generator(nn.Module):
             else TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
         )
 
-    def forward(self, x, s, f0):
+    def forward(self, x, s, f0): # x: b x 512 x max_dur*2, s: b x 1 x sty_dim, f0: b x 1 x max_dur
         with torch.no_grad():
             f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
             har_source, noi_source, uv = self.m_source(f0)
@@ -375,7 +374,7 @@ class AdainResBlk1d(nn.Module):
         x = self.conv2(self.dropout(x))
         return x
 
-    def forward(self, x, s):
+    def forward(self, x, s): # x: b x d_model x max_dur, s: b x max_dur x sty_dim
         out = self._residual(x, s)
         out = (out + self._shortcut(x)) * torch.rsqrt(torch.tensor(2))
         return out
@@ -399,22 +398,24 @@ class Decoder(nn.Module):
         self.decode.append(AdainResBlk1d(1024 + 2 + 64, 512, style_dim, upsample=True))
         self.F0_conv = weight_norm(nn.Conv1d(1, 1, kernel_size=3, stride=2, groups=1, padding=1))
         self.N_conv = weight_norm(nn.Conv1d(1, 1, kernel_size=3, stride=2, groups=1, padding=1))
+        #TODO hardcoded hidden_dim to 512 for some reason
         self.asr_res = nn.Sequential(weight_norm(nn.Conv1d(512, 64, kernel_size=1)))
         self.generator = Generator(style_dim, resblock_kernel_sizes, upsample_rates, 
                                    upsample_initial_channel, resblock_dilation_sizes, 
                                    upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, disable_complex=disable_complex)
 
-    def forward(self, asr, F0_curve, N, s):
-        F0 = self.F0_conv(F0_curve.unsqueeze(1))
-        N = self.N_conv(N.unsqueeze(1))
-        x = torch.cat([asr, F0, N], axis=1)
-        x = self.encode(x, s)
-        asr_res = self.asr_res(asr)
+    def forward(self, asr, F0_curve, N, s): # asr: b*max_dur x d_model, F0_curve: b x 1 x max_dur, N: b x 1 x max_dur
+        asr = asr.view(F0_curve.shape[0],-1,asr.shape[-1]).transpose(-1,-2) # b x d_model x max_dur
+        F0 = self.F0_conv(F0_curve.transpose(1,2).view(-1,1,1)).view(F0_curve.shape[0],1,-1) # b x 1 x max_dur
+        N = self.N_conv(N.transpose(1,2).view(-1,1,1)).view(N.shape[0],1,-1) # b x 1 x max_dur        
+        x = torch.cat([asr, F0, N], axis=1) # b x (d_model + 2) x max_dur
+        x = self.encode(x, s) # b x 1024 x max_dur
+        asr_res = self.asr_res(asr) # b x 64 x max_dur
         res = True
         for block in self.decode:
             if res:
-                x = torch.cat([x, asr_res, F0, N], axis=1)
-            x = block(x, s)
+                x = torch.cat([x, asr_res, F0, N], axis=1) # b x (1024 + 64 + 2) x max_dur
+            x = block(x, s) # b x 1024 x max_dur {for last block x = b x 512 x max_dur*2}
             if block.upsample_type != "none":
                 res = False
         x = self.generator(x, s, F0_curve)
