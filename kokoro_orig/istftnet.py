@@ -1,6 +1,6 @@
 # ADAPTED from https://github.com/yl4579/StyleTTS2/blob/main/Modules/istftnet.py
 from kokoro.custom_stft import CustomSTFT
-from torch.nn.utils.parametrizations import weight_norm
+from torch.nn.utils import weight_norm
 import math
 import torch
 import torch.nn as nn
@@ -24,9 +24,10 @@ class AdaIN1d(nn.Module):
         self.norm = nn.InstanceNorm1d(num_features, affine=True)
         self.fc = nn.Linear(style_dim, num_features*2)
 
-    def forward(self, x, s): # x: b x d_model x max_dur, s: b x 1 x sty_dim
-        h = self.fc(s).transpose(1,2) # b x (2*d_model) x 1
-        gamma, beta = torch.chunk(h, chunks=2, dim=1) # b x d_model x 1
+    def forward(self, x, s):
+        h = self.fc(s)
+        h = h.view(h.size(0), h.size(1), 1)
+        gamma, beta = torch.chunk(h, chunks=2, dim=1)
         return (1 + gamma) * self.norm(x) + beta
 
 
@@ -90,17 +91,17 @@ class TorchSTFT(nn.Module):
             input_data,
             self.filter_length, self.hop_length, self.win_length, window=self.window.to(input_data.device),
             return_complex=True)
-        return torch.abs(forward_transform), torch.angle(forward_transform) # b x N x T
+        return torch.abs(forward_transform), torch.angle(forward_transform)
 
     def inverse(self, magnitude, phase):
         inverse_transform = torch.istft(
             magnitude * torch.exp(phase * 1j),
-            self.filter_length, self.hop_length, self.win_length, window=self.window.to(magnitude.device)) # b x T
-        return inverse_transform  # b x T
+            self.filter_length, self.hop_length, self.win_length, window=self.window.to(magnitude.device))
+        return inverse_transform.unsqueeze(-2)  # unsqueeze to stay consistent with conv_transpose1d implementation
 
     def forward(self, input_data):
         self.magnitude, self.phase = self.transform(input_data)
-        reconstruction = self.inverse(self.magnitude, self.phase) # b x T
+        reconstruction = self.inverse(self.magnitude, self.phase)
         return reconstruction
 
 
@@ -183,13 +184,14 @@ class SineGen(nn.Module):
 
     def forward(self, f0):
         """ sine_tensor, uv = forward(f0)
-        input F0: tensor(batchsize, length, 1)
+        input F0: tensor(batchsize=1, length, dim=1)
                   f0 for unvoiced steps should be 0
-        output sine_tensor: tensor(batchsize, length, dim)
-        output uv: tensor(batchsize, length, 1)
+        output sine_tensor: tensor(batchsize=1, length, dim)
+        output uv: tensor(batchsize=1, length, 1)
         """
+        f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device)
         # fundamental component
-        fn = torch.mul(f0, torch.arange(1, self.harmonic_num + 2, device=f0.device).view(1,-1)) # b x length x dim = num_harmonics
+        fn = torch.multiply(f0, torch.FloatTensor([[range(1, self.harmonic_num + 2)]]).to(f0.device))
         # generate sine waveforms
         sine_waves = self._f02sine(fn) * self.sine_amp
         # generate uv signal
@@ -245,10 +247,10 @@ class SourceModuleHnNSF(nn.Module):
         """
         # source for harmonic branch
         with torch.no_grad():
-            sine_wavs, uv, _ = self.l_sin_gen(x) # sine = b x max_dur*upsample_scale x harmonics
-        sine_merge = self.l_tanh(self.l_linear(sine_wavs)) # b x max_dur*upsample_scale x 1
+            sine_wavs, uv, _ = self.l_sin_gen(x)
+        sine_merge = self.l_tanh(self.l_linear(sine_wavs))
         # source for noise branch, in the same shape as uv
-        noise = torch.randn_like(uv) * self.sine_amp / 3 # b x max_dur*upsample_scale x 1
+        noise = torch.randn_like(uv) * self.sine_amp / 3
         return sine_merge, noise, uv
 
 
@@ -294,18 +296,18 @@ class Generator(nn.Module):
             else TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
         )
 
-    def forward(self, x, s, f0, m): # x: b x 512 x frames*2, s: b x 1 x sty_dim, f0: b x 1 x frames
+    def forward(self, x, s, f0):
         with torch.no_grad():
-            f0 = self.f0_upsamp(f0).transpose(1, 2)  # b x max_dur*upsample_scale x 1
-            har_source, noi_source, uv = self.m_source(f0) # har_source = b x max_dur*upsample_scale x 1
-            har_source = har_source.transpose(1, 2).squeeze(1) # b x max_dur*upsample_scale
-            har_spec, har_phase = self.stft.transform(har_source) # b x N x frames
-            har = torch.cat([har_spec, har_phase], dim=1) # b x N x 2*frames
+            f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
+            har_source, noi_source, uv = self.m_source(f0)
+            har_source = har_source.transpose(1, 2).squeeze(1)
+            har_spec, har_phase = self.stft.transform(har_source)
+            har = torch.cat([har_spec, har_phase], dim=1)
         for i in range(self.num_upsamples):
-            x = F.leaky_relu(x, negative_slope=0.1) # b x 512 x frames*2
-            x_source = self.noise_convs[i](har) # b x c_cur x frames*2
-            x_source = self.noise_res[i](x_source, s) # b x c_cur x frames*2
-            x = self.ups[i](x) # b x c_cur x frames*2 {for first layer x = b x 512 x frames*2}
+            x = F.leaky_relu(x, negative_slope=0.1) 
+            x_source = self.noise_convs[i](har)
+            x_source = self.noise_res[i](x_source, s)
+            x = self.ups[i](x)
             if i == self.num_upsamples - 1:
                 x = self.reflection_pad(x)
             x = x + x_source
@@ -315,12 +317,12 @@ class Generator(nn.Module):
                     xs = self.resblocks[i*self.num_kernels+j](x, s)
                 else:
                     xs += self.resblocks[i*self.num_kernels+j](x, s)
-            x = xs / self.num_kernels # b x c_cur x frames*2
+            x = xs / self.num_kernels
         x = F.leaky_relu(x)
-        x = self.conv_post(x) # b x 22 x frames*2
-        spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :]) # b x 22 x frames*2
-        phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :]) # b x 22 x frames*2
-        return self.stft.inverse(spec, phase) # b x T
+        x = self.conv_post(x)
+        spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
+        phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
+        return self.stft.inverse(spec, phase)
 
 
 class UpSample1d(nn.Module):
@@ -357,28 +359,26 @@ class AdainResBlk1d(nn.Module):
         if self.learned_sc:
             self.conv1x1 = weight_norm(nn.Conv1d(dim_in, dim_out, 1, 1, 0, bias=False))
 
-    def _shortcut(self, x, frame_mask):
+    def _shortcut(self, x):
         x = self.upsample(x)
         if self.learned_sc:
             x = self.conv1x1(x)
-        x = x * frame_mask
         return x
 
-    def _residual(self, x, s, upsampled_mask, frame_mask):
-        x = self.norm1(x, s) * frame_mask
+    def _residual(self, x, s):
+        x = self.norm1(x, s)
         x = self.actv(x)
         x = self.pool(x)
         x = self.conv1(self.dropout(x))
-        x = self.norm2(x, s) * upsampled_mask
+        x = self.norm2(x, s)
         x = self.actv(x)
         x = self.conv2(self.dropout(x))
         return x
 
-    def forward(self, x, s, frame_mask): # x: b x d_model x max_dur, s: b x 1 x sty_dim
-        upsampled_mask = self.upsample(frame_mask)
-        out = self._residual(x, s, upsampled_mask, frame_mask)
-        out = (out + self._shortcut(x, upsampled_mask)) * torch.rsqrt(torch.tensor(2)) * upsampled_mask
-        return out, upsampled_mask
+    def forward(self, x, s):
+        out = self._residual(x, s)
+        out = (out + self._shortcut(x)) * torch.rsqrt(torch.tensor(2))
+        return out
 
 
 class Decoder(nn.Module):
@@ -399,26 +399,23 @@ class Decoder(nn.Module):
         self.decode.append(AdainResBlk1d(1024 + 2 + 64, 512, style_dim, upsample=True))
         self.F0_conv = weight_norm(nn.Conv1d(1, 1, kernel_size=3, stride=2, groups=1, padding=1))
         self.N_conv = weight_norm(nn.Conv1d(1, 1, kernel_size=3, stride=2, groups=1, padding=1))
-        #TODO hardcoded hidden_dim to 512 for some reason
         self.asr_res = nn.Sequential(weight_norm(nn.Conv1d(512, 64, kernel_size=1)))
         self.generator = Generator(style_dim, resblock_kernel_sizes, upsample_rates, 
                                    upsample_initial_channel, resblock_dilation_sizes, 
                                    upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, disable_complex=disable_complex)
 
-    def forward(self, asr, F0_curve, N, s, frame_mask): # asr: b x max_dur x d_model, F0_curve: b x 1 x 2*max_dur, N: b x 1 x 2*max_dur
-        m = frame_mask.unsqueeze(1)
-        asr = asr.transpose(-1,-2) # b x d_model x max_dur
-        F0 = self.F0_conv(F0_curve) # b x 1 x max_dur
-        N = self.N_conv(N) # b x 1 x max_dur   
-        x = torch.cat([asr, F0, N], axis=1) * m # b x (d_model + 2) x max_dur
-        x, _ = self.encode(x, s, m) # b x 1024 x max_dur
-        asr_res = self.asr_res(asr) # b x 64 x max_dur
+    def forward(self, asr, F0_curve, N, s):
+        F0 = self.F0_conv(F0_curve.unsqueeze(1))
+        N = self.N_conv(N.unsqueeze(1))
+        x = torch.cat([asr, F0, N], axis=1)
+        x = self.encode(x, s)
+        asr_res = self.asr_res(asr)
         res = True
         for block in self.decode:
             if res:
-                x = torch.cat([x, asr_res, F0, N], axis=1) * m # b x (1024 + 64 + 2) x max_dur
-            x, m = block(x, s, m) # b x 1024 x max_dur {for last block x = b x 512 x max_dur*2}
+                x = torch.cat([x, asr_res, F0, N], axis=1)
+            x = block(x, s)
             if block.upsample_type != "none":
                 res = False
-        x = self.generator(x, s, F0_curve, m) # b x T
+        x = self.generator(x, s, F0_curve)
         return x

@@ -3,7 +3,6 @@ from .modules import CustomAlbert, ProsodyPredictor, TextEncoder
 from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 from loguru import logger
-from torch import nn
 from transformers import AlbertConfig
 from typing import Dict, Optional, Union
 import json
@@ -83,82 +82,40 @@ class KModel(torch.nn.Module):
     class Output:
         audio: torch.FloatTensor
         pred_dur: Optional[torch.LongTensor] = None
-    
-    def reshape_for_batch(self, x, updated_seq_lengths):
-        """
-        Reshape a tensor x (b*seq_len x d_model) to a batch of sequences with variable lengths.
-        """
-        max_len = updated_seq_lengths.max()
-        end_indices = updated_seq_lengths.cumsum(dim=0)
-        start_indices = torch.cat([torch.zeros(1, device=end_indices.device, dtype=end_indices.dtype), 
-                                end_indices[:-1]])
-        seq_range = torch.arange(max_len, device=x.device).unsqueeze(0)
-        valid_mask = seq_range < updated_seq_lengths.unsqueeze(1)
-        indices = (start_indices.unsqueeze(1) + seq_range).masked_fill(~valid_mask, 0)
-        batched = torch.zeros(updated_seq_lengths.size(0), max_len, x.shape[-1], device=x.device, dtype=x.dtype)
-        batched[valid_mask] = x[indices[valid_mask]]
-        return batched
-    
-    def get_sequence_mask(self, input, input_lengths):
-        # Create text mask where True means "this position is a padding token"
-        max_len = input.shape[1]
-        text_mask = torch.arange(max_len, device=self.device).unsqueeze(0).expand(input.shape[0], -1)
-        text_mask = (text_mask >= input_lengths.unsqueeze(1)).to(self.device)
-        return text_mask
-    
+
     @torch.no_grad()
     def forward_with_tokens(
         self,
         input_ids: torch.LongTensor,
         ref_s: torch.FloatTensor,
-        speed: float,
-        input_lengths: Optional[torch.LongTensor]
+        speed: float = 1
     ) -> tuple[torch.FloatTensor, torch.LongTensor]:
-        batch_size = input_ids.shape[0]
-        s = ref_s[:, :, 128:] # b x 1 x sty_dim
-            
-        sequence_mask = self.get_sequence_mask(input_ids, input_lengths)
-        # Convert to attention mask where 1 means "attend to this token" and 0 means "ignore this token"
-        attention_mask = (~sequence_mask).float()
-        
-        # Forward pass through BERT
-        bert_dur = self.bert(input_ids, attention_mask=attention_mask) # b x seq_len x hidden
-        d_en = self.bert_encoder(bert_dur) # b x seq_len x hidden
-        
-        # Pass through predictor
-        d = self.predictor.text_encoder(d_en, s, input_lengths, sequence_mask) # b x seq_len x (d_model + sty_dim)
+        input_lengths = torch.full(
+            (input_ids.shape[0],), 
+            input_ids.shape[-1], 
+            device=input_ids.device,
+            dtype=torch.long
+        )
 
-        x = nn.utils.rnn.pack_padded_sequence(d, input_lengths, batch_first=True, enforce_sorted=False)
-        self.predictor.lstm.flatten_parameters()
-        x, _ = self.predictor.lstm(x)
-        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True, padding_value=0.0, total_length=d_en.shape[1]) # b x seq_len x d_model
-
-
-        duration = self.predictor.duration_proj(x) # b x seq_len x max_dur
-        duration = torch.sigmoid(duration).sum(axis=-1) / speed # b x seq_len
-        # For each sequence, we only care about the non-padded tokens
-        # Mask out durations for padded tokens
-        duration = torch.round(duration * attention_mask).clamp(min=1).long() # b x seq_len
-        updated_seq_lengths = torch.sum(duration, dim=-1) # b
-
-        
-        # Flatten the durations for each sequence
-        pred_dur = duration.view(-1) # b*seq_len
-        d_flat = d.view(-1, d.shape[-1]) # b*seq_len x (d_model + sty_dim)
-        # Create alignment target
-        indices = torch.repeat_interleave(torch.arange(0, pred_dur.shape[0], device=self.device), pred_dur) # b*max_dur
-        pred_aln_trg = torch.zeros((indices.shape[0], pred_dur.shape[0]), device=self.device) # b*max_dur x b*seq_len
-        pred_aln_trg[torch.arange(indices.shape[0]), indices] = 1
-        en = pred_aln_trg @ d_flat # b*max_dur x (d_model + sty_dim)
-        en = self.reshape_for_batch(en, updated_seq_lengths) # b x max_dur x (d_model + sty_dim)
-        updated_frame_mask = self.get_sequence_mask(en, updated_seq_lengths)
-        updated_frame_mask = (~updated_frame_mask).float()
-        F0_pred, N_pred, _ = self.predictor.F0Ntrain(en, s, updated_seq_lengths, updated_frame_mask) # b x 1 x 2*max_dur, b x 1 x 2*max_dur
-        t_en = self.text_encoder(input_ids, input_lengths, attention_mask) # b x seq_len x d_model
-        t_en_flat = t_en.view(-1, t_en.shape[-1]) # b*seq_len x d_model
-        asr = pred_aln_trg @ t_en_flat # b*max_dur x d_model
-        asr = self.reshape_for_batch(asr, updated_seq_lengths) * updated_frame_mask.unsqueeze(-1) # b x max_dur x d_model
-        audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :, :128], updated_frame_mask) # b x T
+        text_mask = torch.arange(input_lengths.max()).unsqueeze(0).expand(input_lengths.shape[0], -1).type_as(input_lengths)
+        text_mask = torch.gt(text_mask+1, input_lengths.unsqueeze(1)).to(self.device)
+        bert_dur = self.bert(input_ids, attention_mask=(~text_mask).int())
+        d_en = self.bert_encoder(bert_dur).transpose(-1, -2)
+        s = ref_s[:, 128:]
+        d = self.predictor.text_encoder(d_en, s, input_lengths, text_mask)
+        x, _ = self.predictor.lstm(d)
+        duration = self.predictor.duration_proj(x)
+        duration = torch.sigmoid(duration).sum(axis=-1) / speed
+        pred_dur = torch.round(duration).clamp(min=1).long().squeeze()
+        indices = torch.repeat_interleave(torch.arange(input_ids.shape[1], device=self.device), pred_dur)
+        pred_aln_trg = torch.zeros((input_ids.shape[1], indices.shape[0]), device=self.device)
+        pred_aln_trg[indices, torch.arange(indices.shape[0])] = 1
+        pred_aln_trg = pred_aln_trg.unsqueeze(0).to(self.device)
+        en = d.transpose(-1, -2) @ pred_aln_trg
+        F0_pred, N_pred = self.predictor.F0Ntrain(en, s)
+        t_en = self.text_encoder(input_ids, input_lengths, text_mask)
+        asr = t_en @ pred_aln_trg
+        audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze()
         return audio, pred_dur
 
     def forward(
