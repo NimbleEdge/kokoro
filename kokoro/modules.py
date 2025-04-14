@@ -53,11 +53,11 @@ class TextEncoder(nn.Module):
             x = c(x)
             x = x * frame_mask.unsqueeze(1)
         x = x.transpose(1, 2)
-        lengths = input_lengths if input_lengths.device == torch.device('cpu') else input_lengths.to('cpu')
-        x = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
-        self.lstm.flatten_parameters()
+        # lengths = input_lengths if input_lengths.device == torch.device('cpu') else input_lengths.to('cpu')
+        # x = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+        # self.lstm.flatten_parameters()
         x, _ = self.lstm(x)
-        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+        # x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
         return x
 
 
@@ -148,13 +148,13 @@ class DurationEncoder(nn.Module):
                 x = torch.cat([x, s], axis=-1)
                 x.masked_fill_(m.unsqueeze(-1), 0.0)
             else:
-                lengths = text_lengths if text_lengths.device == torch.device('cpu') else text_lengths.to('cpu')
-                x = nn.utils.rnn.pack_padded_sequence(
-                    x, lengths, batch_first=True, enforce_sorted=False)
+                # lengths = text_lengths if text_lengths.device == torch.device('cpu') else text_lengths.to('cpu')
+                # x = nn.utils.rnn.pack_padded_sequence(
+                    # x, lengths, batch_first=True, enforce_sorted=False)
                 block.flatten_parameters()
                 x, _ = block(x)
-                x, _ = nn.utils.rnn.pad_packed_sequence(
-                    x, batch_first=True) # b x seq_len x d_model
+                # x, _ = nn.utils.rnn.pad_packed_sequence(
+                    # x, batch_first=True) # b x seq_len x d_model
                 # x = F.dropout(x, p=self.dropout, training=False)
         return x
 

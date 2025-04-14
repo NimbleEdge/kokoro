@@ -127,13 +127,7 @@ class KModel(torch.nn.Module):
         
         # Pass through predictor
         d = self.predictor.text_encoder(d_en, s, input_lengths, sequence_mask) # b x seq_len x (d_model + sty_dim)
-
-        x = nn.utils.rnn.pack_padded_sequence(d, input_lengths, batch_first=True, enforce_sorted=False)
-        self.predictor.lstm.flatten_parameters()
-        x, _ = self.predictor.lstm(x)
-        x, _ = nn.utils.rnn.pad_packed_sequence(x, batch_first=True, padding_value=0.0, total_length=d_en.shape[1]) # b x seq_len x d_model
-
-
+        x, _ = self.predictor.lstm(d)
         duration = self.predictor.duration_proj(x) # b x seq_len x max_dur
         duration = torch.sigmoid(duration).sum(axis=-1) / speed # b x seq_len
         # For each sequence, we only care about the non-padded tokens
@@ -155,11 +149,11 @@ class KModel(torch.nn.Module):
         updated_frame_mask = (~updated_frame_mask).float()
         F0_pred, N_pred, _ = self.predictor.F0Ntrain(en, s, updated_seq_lengths, updated_frame_mask) # b x 1 x 2*max_dur, b x 1 x 2*max_dur
         t_en = self.text_encoder(input_ids, input_lengths, attention_mask) # b x seq_len x d_model
-        t_en_flat = t_en.view(-1, t_en.shape[-1]) # b*seq_len x d_model
+        t_en_flat = t_en.reshape(-1, t_en.shape[-1]) # b*seq_len x d_model
         asr = pred_aln_trg @ t_en_flat # b*max_dur x d_model
         asr = self.reshape_for_batch(asr, updated_seq_lengths) * updated_frame_mask.unsqueeze(-1) # b x max_dur x d_model
         audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :, :128], updated_frame_mask) # b x T
-        return audio, pred_dur
+        return audio#, pred_dur
 
     def forward(
         self,

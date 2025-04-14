@@ -146,7 +146,14 @@ class SineGen(nn.Module):
         # because 2 * torch.pi * n doesn't affect phase
         rad_values = (f0_values / self.sampling_rate) % 1
         # initial phase noise (no noise for fundamental component)
-        rand_ini = torch.rand(f0_values.shape[0], f0_values.shape[2], device=f0_values.device)
+        # Instead, use this deterministic approach that preserves the exact shape:
+        total_elements = f0_values.shape[0] * f0_values.shape[2]
+        indices = torch.arange(total_elements, device=f0_values.device)
+        # Create a sine wave that varies smoothly
+        rand_ini = torch.sin(indices * 0.1) * 0.5 + 0.5  # Scale to 0-1 range
+        # Reshape to match the original dimensions
+        rand_ini = rand_ini.reshape(f0_values.shape[0], f0_values.shape[2]).to(dtype=torch.float16)
+        # rand_ini = torch.rand(f0_values.shape[0], f0_values.shape[2], device=f0_values.device, dtype=torch.float16)
         rand_ini[:, 0] = 0
         rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
         # instantanouse phase sine[t] = sin(2*pi \sum_i=1 ^{t} rad)
@@ -200,7 +207,7 @@ class SineGen(nn.Module):
         #        std = self.sine_amp/3 -> max value ~ self.sine_amp
         #        for voiced regions is self.noise_std
         noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-        noise = noise_amp * torch.randn_like(sine_waves)
+        noise = noise_amp * torch.linspace(0.1, 0.9, sine_waves.shape[-1]).expand_as(sine_waves)
         # first: set the unvoiced part to 0 by uv
         # then: additive noise
         sine_waves = sine_waves * uv + noise
@@ -248,7 +255,7 @@ class SourceModuleHnNSF(nn.Module):
             sine_wavs, uv, _ = self.l_sin_gen(x) # sine = b x max_dur*upsample_scale x harmonics
         sine_merge = self.l_tanh(self.l_linear(sine_wavs)) # b x max_dur*upsample_scale x 1
         # source for noise branch, in the same shape as uv
-        noise = torch.randn_like(uv) * self.sine_amp / 3 # b x max_dur*upsample_scale x 1
+        noise = torch.linspace(0.1, 0.9, uv.shape[-1]).expand_as(uv) * self.sine_amp / 3 # b x max_dur*upsample_scale x 1
         return sine_merge, noise, uv
 
 
