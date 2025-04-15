@@ -84,28 +84,6 @@ class KModel(torch.nn.Module):
         audio: torch.FloatTensor
         pred_dur: Optional[torch.LongTensor] = None
     
-    def reshape_for_batch(self, x, updated_seq_lengths):
-        """
-        Reshape a tensor x (b*seq_len x d_model) to a batch of sequences with variable lengths.
-        """
-        max_len = updated_seq_lengths.max()
-        end_indices = updated_seq_lengths.cumsum(dim=0)
-        start_indices = torch.cat([torch.zeros(1, device=end_indices.device, dtype=end_indices.dtype), 
-                                end_indices[:-1]])
-        seq_range = torch.arange(max_len, device=x.device).unsqueeze(0)
-        valid_mask = seq_range < updated_seq_lengths.unsqueeze(1)
-        indices = (start_indices.unsqueeze(1) + seq_range).masked_fill(~valid_mask, 0)
-        batched = torch.zeros(updated_seq_lengths.size(0), max_len, x.shape[-1], device=x.device, dtype=x.dtype)
-        batched[valid_mask] = x[indices[valid_mask]]
-        return batched
-    
-    def get_sequence_mask(self, input, input_lengths):
-        # Create text mask where True means "this position is a padding token"
-        max_len = input.shape[1]
-        text_mask = torch.arange(max_len, device=self.device).unsqueeze(0).expand(input.shape[0], -1)
-        text_mask = (text_mask >= input_lengths.unsqueeze(1)).to(self.device)
-        return text_mask
-    
     @torch.no_grad()
     def forward_with_tokens(
         self,
@@ -114,10 +92,11 @@ class KModel(torch.nn.Module):
         speed: float,
         input_lengths: Optional[torch.LongTensor]
     ) -> tuple[torch.FloatTensor, torch.LongTensor]:
-        batch_size = input_ids.shape[0]
         s = ref_s[:, :, 128:] # b x 1 x sty_dim
-            
-        sequence_mask = self.get_sequence_mask(input_ids, input_lengths)
+    
+        max_len = input_ids.shape[1]
+        text_mask = torch.arange(max_len, device=self.device).unsqueeze(0)
+        sequence_mask = (text_mask.expand(input_ids.shape[0], -1) >= input_lengths.unsqueeze(1)).to(self.device) # b x seq_len
         # Convert to attention mask where 1 means "attend to this token" and 0 means "ignore this token"
         attention_mask = (~sequence_mask).float()
         
@@ -134,24 +113,20 @@ class KModel(torch.nn.Module):
         # Mask out durations for padded tokens
         duration = torch.round(duration * attention_mask).clamp(min=1).long() # b x seq_len
         updated_seq_lengths = torch.sum(duration, dim=-1) # b
-
+        max_frames = updated_seq_lengths.max()
         
-        # Flatten the durations for each sequence
-        pred_dur = duration.view(-1) # b*seq_len
-        d_flat = d.view(-1, d.shape[-1]) # b*seq_len x (d_model + sty_dim)
-        # Create alignment target
-        indices = torch.repeat_interleave(torch.arange(0, pred_dur.shape[0], device=self.device), pred_dur) # b*max_dur
-        pred_aln_trg = torch.zeros((indices.shape[0], pred_dur.shape[0]), device=self.device) # b*max_dur x b*seq_len
-        pred_aln_trg[torch.arange(indices.shape[0]), indices] = 1
-        en = pred_aln_trg @ d_flat # b*max_dur x (d_model + sty_dim)
-        en = self.reshape_for_batch(en, updated_seq_lengths) # b x max_dur x (d_model + sty_dim)
-        updated_frame_mask = self.get_sequence_mask(en, updated_seq_lengths)
+        frame_indices = torch.arange(max_frames, device=self.device).view(1,1,-1) # 1 x 1 x max_dur
+        duration_cumsum = duration.cumsum(dim=1).unsqueeze(-1) # b x seq_len x 1
+        mask1 = duration_cumsum > frame_indices # b x seq_len x max_dur
+        mask2 = frame_indices >= torch.cat([torch.zeros(duration.shape[0],1, 1), duration_cumsum[:,:-1,:]],dim=1) # b x seq_len x max_dur
+        pred_aln_trg = (mask1 & mask2).float().transpose(1, 2) # b x max_dur x seq_len 
+        en = torch.bmm(pred_aln_trg, d) # b x max_dur x (d_model + sty_dim)
+
+        updated_frame_mask = (frame_indices.squeeze(1).expand(en.shape[0], -1) >= updated_seq_lengths.unsqueeze(1)).to(self.device)
         updated_frame_mask = (~updated_frame_mask).float()
         F0_pred, N_pred, _ = self.predictor.F0Ntrain(en, s, updated_seq_lengths, updated_frame_mask) # b x 1 x 2*max_dur, b x 1 x 2*max_dur
         t_en = self.text_encoder(input_ids, input_lengths, attention_mask) # b x seq_len x d_model
-        t_en_flat = t_en.reshape(-1, t_en.shape[-1]) # b*seq_len x d_model
-        asr = pred_aln_trg @ t_en_flat # b*max_dur x d_model
-        asr = self.reshape_for_batch(asr, updated_seq_lengths) * updated_frame_mask.unsqueeze(-1) # b x max_dur x d_model
+        asr = torch.bmm(pred_aln_trg, t_en) * updated_frame_mask.unsqueeze(-1) # b x max_dur x d_model
         audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :, :128], updated_frame_mask) # b x T
         return audio#, pred_dur
 
