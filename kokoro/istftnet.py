@@ -147,12 +147,12 @@ class SineGen(nn.Module):
         rad_values = (f0_values / self.sampling_rate) % 1
         # initial phase noise (no noise for fundamental component)
         # Instead, use this deterministic approach that preserves the exact shape:
-        total_elements = f0_values.shape[0] * f0_values.shape[2]
+        total_elements = f0_values.shape[2]
         indices = torch.arange(total_elements, device=f0_values.device)
         # Create a sine wave that varies smoothly
         rand_ini = torch.sin(indices * 0.1) * 0.5 + 0.5  # Scale to 0-1 range
         # Reshape to match the original dimensions
-        rand_ini = rand_ini.reshape(f0_values.shape[0], f0_values.shape[2]).to(dtype=torch.float16)
+        rand_ini = rand_ini.expand(f0_values.shape[0],-1).to(dtype=torch.float16)
         # rand_ini = torch.rand(f0_values.shape[0], f0_values.shape[2], device=f0_values.device, dtype=torch.float16)
         rand_ini[:, 0] = 0
         rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
@@ -301,7 +301,7 @@ class Generator(nn.Module):
             else TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
         )
 
-    def forward(self, x, s, f0, m): # x: b x 512 x frames*2, s: b x 1 x sty_dim, f0: b x 1 x frames
+    def forward(self, x, s, f0): # x: b x 512 x frames*2, s: b x 1 x sty_dim, f0: b x 1 x frames
         with torch.no_grad():
             f0 = self.f0_upsamp(f0).transpose(1, 2)  # b x max_dur*upsample_scale x 1
             har_source, noi_source, uv = self.m_source(f0) # har_source = b x max_dur*upsample_scale x 1
@@ -427,5 +427,5 @@ class Decoder(nn.Module):
             x, m = block(x, s, m) # b x 1024 x max_dur {for last block x = b x 512 x max_dur*2}
             if block.upsample_type != "none":
                 res = False
-        x = self.generator(x, s, F0_curve, m) # b x T
+        x = self.generator(x, s, F0_curve) # b x T
         return x

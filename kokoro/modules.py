@@ -1,6 +1,6 @@
 # https://github.com/yl4579/StyleTTS2/blob/main/models.py
 from .istftnet import AdainResBlk1d
-from torch.nn.utils import weight_norm
+from torch.nn.utils.parametrizations import weight_norm
 from transformers import AlbertModel
 import numpy as np
 import torch
@@ -69,7 +69,6 @@ class AdaLayerNorm(nn.Module):
         self.fc = nn.Linear(style_dim, channels*2)
 
     def forward(self, x, s): # x: b x seq_len x d_model, s: b x 1/seq_len x sty_dim
-        print(f"x shape: {x.shape}, s shape: {s.shape}")
         h = self.fc(s)
         gamma, beta = torch.chunk(h, chunks=2, dim=-1) # b x 1/seq_len x d_model
         x = F.layer_norm(x, (self.channels,), eps=self.eps)

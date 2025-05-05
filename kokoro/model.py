@@ -8,6 +8,8 @@ from transformers import AlbertConfig
 from typing import Dict, Optional, Union
 import json
 import torch
+import os
+import numpy as np
 
 class KModel(torch.nn.Module):
     '''
@@ -34,7 +36,8 @@ class KModel(torch.nn.Module):
         repo_id: Optional[str] = None,
         config: Union[Dict, str, None] = None,
         model: Optional[str] = None,
-        disable_complex: bool = False
+        disable_complex: bool = False,
+        voice_name: Optional[str] = None
     ):
         super().__init__()
         if repo_id is None:
@@ -64,6 +67,11 @@ class KModel(torch.nn.Module):
             dim_in=config['hidden_dim'], style_dim=config['style_dim'],
             dim_out=config['n_mels'], disable_complex=disable_complex, **config['istftnet']
         )
+        if voice_name is None:
+            voice_name = "af_heart"
+        voice_path = f"./voices/{voice_name}.bin"
+        self.ref_s = self.load_bin_voice(voice_path).to(self.device)
+    
         if not model:
             model = hf_hub_download(repo_id=repo_id, filename=KModel.MODEL_NAMES[repo_id])
         for key, state_dict in torch.load(model, map_location='cpu', weights_only=True).items():
@@ -74,6 +82,30 @@ class KModel(torch.nn.Module):
                 logger.debug(f"Did not load {key} from state_dict")
                 state_dict = {k[7:]: v for k, v in state_dict.items()}
                 getattr(self, key).load_state_dict(state_dict, strict=False)
+
+    def load_bin_voice(self, voice_path: str) -> torch.Tensor:
+        """
+        Load a .bin voice file as a PyTorch tensor.
+        
+        Args:
+            voice_path: Path to the .bin voice file
+            
+        Returns:
+            PyTorch tensor containing the voice data
+        """
+        if not os.path.exists(voice_path):
+            raise FileNotFoundError(f"Voice file not found: {voice_path}")
+        
+        if not voice_path.endswith('.bin'):
+            raise ValueError(f"Expected a .bin file, got: {voice_path}")
+        
+        # Load the binary file as a numpy array of float32 values
+        voice_data = np.fromfile(voice_path, dtype=np.float32).reshape(-1, 1, 256)
+        # Convert to PyTorch tensor
+        voice_tensor = torch.tensor(voice_data, dtype=torch.float32)
+        
+        # Return the tensor
+        return voice_tensor
 
     @property
     def device(self):
@@ -88,10 +120,10 @@ class KModel(torch.nn.Module):
     def forward_with_tokens(
         self,
         input_ids: torch.LongTensor,
-        ref_s: torch.FloatTensor,
         speed: float,
         input_lengths: Optional[torch.LongTensor]
     ) -> tuple[torch.FloatTensor, torch.LongTensor]:
+        ref_s = self.ref_s[input_lengths,:,:]
         s = ref_s[:, :, 128:] # b x 1 x sty_dim
     
         max_len = input_ids.shape[1]
@@ -108,11 +140,12 @@ class KModel(torch.nn.Module):
         d = self.predictor.text_encoder(d_en, s, input_lengths, sequence_mask) # b x seq_len x (d_model + sty_dim)
         x, _ = self.predictor.lstm(d)
         duration = self.predictor.duration_proj(x) # b x seq_len x max_dur
-        duration = torch.sigmoid(duration).sum(axis=-1) / speed # b x seq_len
+        duration = torch.round(((torch.sigmoid(duration)).sum(dim=-1) * attention_mask) / speed) # b x seq_len
+        updated_seq_lengths = torch.sum(duration, dim=-1) # b
+        duration = duration.to(torch.float32)
         # For each sequence, we only care about the non-padded tokens
         # Mask out durations for padded tokens
-        duration = torch.round(duration * attention_mask).clamp(min=1).long() # b x seq_len
-        updated_seq_lengths = torch.sum(duration, dim=-1) # b
+        duration = duration.clamp(min=1).long() # b x seq_len
         max_frames = updated_seq_lengths.max()
         
         frame_indices = torch.arange(max_frames, device=self.device).view(1,1,-1) # 1 x 1 x max_dur
@@ -128,7 +161,8 @@ class KModel(torch.nn.Module):
         t_en = self.text_encoder(input_ids, input_lengths, attention_mask) # b x seq_len x d_model
         asr = torch.bmm(pred_aln_trg, t_en) * updated_frame_mask.unsqueeze(-1) # b x max_dur x d_model
         audio = self.decoder(asr, F0_pred, N_pred, ref_s[:, :, :128], updated_frame_mask) # b x T
-        return audio#, pred_dur
+        frame_lengths = updated_seq_lengths * (audio.shape[-1]//max_frames)
+        return audio, frame_lengths.long()
 
     def forward(
         self,
