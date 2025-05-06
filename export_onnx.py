@@ -17,12 +17,12 @@ set_lexicon(json.load(open("./misaki_lexicons/us_gold.json")) | json.load(open("
 input_id_tensors = []
 
 for t in text:
-    ps, mtoks = phonemize(t)
+    ps = phonemize(t)["ps"]
     toks = list(filter(lambda i: i is not None, map(lambda p: model.vocab.get(p), ps)))
     input_id_tensors.append(torch.tensor([0,*toks,0], dtype=torch.long))
 input_lengths = torch.tensor([toks.shape[0] for toks in input_id_tensors], dtype=torch.long)
 input_ids = rnn.pad_sequence(input_id_tensors, batch_first=True, padding_value=0)
-print(input_lengths, input_ids.shape)
+print(input_lengths, input_ids)
 
 audio, pred_dur = model.forward_with_tokens(input_ids, 1.0,input_lengths)
 

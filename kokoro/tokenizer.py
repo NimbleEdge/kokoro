@@ -638,3 +638,4 @@ def phonemize(text):
 
 def set_lexicon(lexicon):
     LEXICON = lexicon
+    print("LEXICON Sample keys", list(LEXICON.keys())[:10])
