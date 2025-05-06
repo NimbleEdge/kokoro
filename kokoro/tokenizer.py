@@ -4,8 +4,10 @@ Python implementation of the tokenizer for ONNX models.
 Converted from JavaScript to be compatible with Python-based ONNX implementations.
 """
 import re
-from nimbleedge import nimblenet as nm
+import json
+from phonemizer.backend import EspeakBackend
 
+backend = EspeakBackend('en-us')
 STRESSES = 'ˌˈ'
 PRIMARY_STRESS = STRESSES[1]
 SECONDARY_STRESS = STRESSES[0]
@@ -14,6 +16,7 @@ VOWELS = ['A', 'I', 'O', 'Q', 'W', 'Y', 'a', 'i', 'u', 'æ', 'ɑ', 'ɒ', 'ɔ', '
 SUBTOKEN_JUNKS = "',-._'’/' "
 PUNCTS = ['?', ',', ';', '“', '—', ':', '!', '.', '…', '"', '”']
 NON_QUOTE_PUNCTS = ['?', ',', '—', '.', ':', '!', ';', '…']
+
 LEXICON = None
 
 CURRENCIES = {
@@ -110,9 +113,7 @@ def merge_tokens(tokens, unk):
             phonemes = phonemes
         else:
             phonemes = phonemes + t.phonemes
-    print("final phonemes", phonemes)
     if isspace(phonemes[0]):
-        print("deleting space")
         phonemes = phonemes[1:]
     stress_token = None
     if len(stress) == 1:
@@ -596,16 +597,13 @@ def tokenize(tokens, features, nonStringFeatureIndexList):
                     phoneme = tok
                     whitespace=False
                 elif LEXICON is not None and tok in LEXICON:
-                    print("found tok", tok, LEXICON[tok])
                     phoneme = LEXICON[tok]
                 else:
                     tok_lower = tok.lower()
                     if LEXICON is not None and tok_lower in LEXICON:
-                        print("found tok", tok_lower, LEXICON[tok_lower])
                         phoneme = LEXICON[tok_lower]
                     else:
-                        print("not found tok lower:"+ tok_lower+ "tok:"+tok)
-                        phoneme = nm.convertTextToPhonemes(tok_lower)
+                        phoneme = backend.phonemize([tok_lower], strip=True)[0]
                 stress = None
                 if feature is not None and not i in nonStringFeatureIndexList:
                     stress = feature
@@ -633,14 +631,10 @@ def phonemize(text):
         The phonemized text and the tokens used for phonemization.
     """
     _, tokens, features, nonStringFeatureIndexList = preprocess(text)
-    print("tokens", [t for t in tokens], "features", features, nonStringFeatureIndexList)
     tokens = tokenize(tokens, features, nonStringFeatureIndexList)   
-    print("tokens after tokenize", [t.phonemes for t in tokens]) 
-    result = resolve_tokens(tokens)    
+    result = resolve_tokens(tokens)
+    print("Result Phonemes", result)
     return {"ps": result, "tokens": tokens}
 
-
-def init(input):
-    LEXICON = input["lexicon"]
-    print(LEXICON["'Merica"])
-    return {}
+def set_lexicon(lexicon):
+    LEXICON = lexicon

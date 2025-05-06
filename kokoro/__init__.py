@@ -20,4 +20,4 @@ logger.add(
 logger.disable("kokoro")
 
 from .model import KModel
-from .tokenizer import phonemize
+from .tokenizer import phonemize, set_lexicon
