@@ -1,12 +1,10 @@
 # %%
-from kokoro import KModel
+from kokoro import KModel, phonemize
 import torch
-from misaki import en
 import torch.nn.utils.rnn as rnn
 import onnx
 import os
 import shutil
-g2p = en.G2P(trf=False, british=False, fallback=None, unk='')
 
 text = [
     "This is a test!",
@@ -17,7 +15,7 @@ model = KModel(repo_id="hexgrad/Kokoro-82M", disable_complex=True, voice_name="a
 input_id_tensors = []
 
 for t in text:
-    ps, mtoks = g2p(t)
+    ps, mtoks = phonemize(t)
     toks = list(filter(lambda i: i is not None, map(lambda p: model.vocab.get(p), ps)))
     input_id_tensors.append(torch.tensor([0,*toks,0], dtype=torch.long))
 input_lengths = torch.tensor([toks.shape[0] for toks in input_id_tensors], dtype=torch.long)
@@ -47,7 +45,6 @@ torch.onnx.export(
         'input_ids': { 0: 'batch_size', 1: 'input_ids_len' }, 
         'waveform': { 0: 'batch_size', 1: 'num_samples' }, 
         'frame_lengths': { 0: 'batch_size' },
-        # 'duration': { 0: 'batch_duration' },
         'input_lengths': { 0: 'batch_size' },
     }, 
     do_constant_folding = False, 
