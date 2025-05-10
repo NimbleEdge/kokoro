@@ -40,7 +40,7 @@ Misaki Lexicons are taken from [hexgrad/misaki](https://github.com/hexgrad/misak
 - transformers
 - ONNX Runtime >= 1.20.0 (for ONNX inference)
 
-## Quick Start
+## Quick Start Linux
 
 Here's a simple example to get started with Batch Kokoro:
 
@@ -91,6 +91,174 @@ Here's a [sample of Kokoro's Batch Inference](./output.wav):
 from scipy.io.wavfile import write
 write("./output.wav", 24000, audio[batch_idx][0].numpy())
 ```
+
+## Quick Start On-Device
+
+### Using NimbleEdge Platform
+
+Kokoro can be deployed on-device using the NimbleEdge platform, which provides optimized inference for mobile and edge devices.
+
+#### Setting up NimbleEdge
+
+1. Install the NimbleEdge SDK for your platform (iOS/Android)
+2. Upload the ONNX model assets on the NimbleEdge portal
+
+
+#### Key Features of on_device_workflow
+
+- **Text-to-Speech**: Convert text to high-quality speech using the `run_text_to_speech_model` function
+- **Phoneme Generation**: Accurate phonemization with stress marking using the `phonemize` function
+- **Custom Pronunciation**: Support for custom lexicons through the `init` function
+- **Integration with LLM**: Built-in integration with LLM for conversational applications
+- **Memory Efficient**: Optimized for mobile and edge devices with limited resources
+
+#### Entry Points for Native Integration
+
+The script provides several entry points for integration with Kotlin/iOS applications:
+
+1. `run_text_to_speech_model`: Converts text to speech audio
+2. `prompt_llm`: Sends user input to the LLM
+3. `get_next_str`: Retrieves streaming responses from the LLM
+4. `set_context`: Sets conversation history for contextual responses
+5. `init`: Initializes the model with a custom lexicon
+
+#### Kotlin Integration Examples
+
+Here's how to call these functions from Kotlin:
+
+```kotlin
+import ai.nimbleedge.NimbleNet
+
+class KokoroManager() {
+    
+    // Initialize the model with lexicon
+    NimbleNet.runMethod(
+        "init",
+        inputs = hashMapOf(
+            "lexicon" to NimbleNetTensor(
+                shape = null, data = lexiconArray, datatype = DATATYPE.JSON
+            )
+        )
+    )
+    
+    // Generate speech from text
+    NimbleNet.runMethod(
+        "run_text_to_speech_model",
+        inputs = hashMapOf(
+            "text" to NimbleNetTensor(
+                data = input,
+                shape = null,
+                datatype = DATATYPE.STRING
+            )
+        )
+    )
+    
+    // Send user query to LLM
+    NimbleNet.runMethod(
+        "prompt_llm",
+        inputs = hashMapOf(
+            "query" to NimbleNetTensor(input, DATATYPE.STRING, null),
+            "is_voice_initiated" to NimbleNetTensor(
+                if (isVoiceInitiated) 1 else 0,
+                DATATYPE.INT32,
+                null
+            )
+        ),
+    )
+    
+    // Get next chunk of LLM response
+    NimbleNet.runMethod("get_next_str", hashMapOf())
+    
+    // Set conversation history context
+    NimbleNet.runMethod(
+        "set_context", hashMapOf(
+            "context" to NimbleNetTensor(
+                data = historicalContext,
+                datatype = DATATYPE.JSON_ARRAY,
+                shape = intArrayOf(historicalContext.length())
+            )
+        )
+    )
+}
+```
+
+#### Swift (iOS) Integration Examples
+
+Here's how to call these functions from Swift:
+
+```swift
+import NimbleNet
+
+// Initialize the model with lexicon
+NimbleNet.runMethod(
+    "init",
+    inputs: [
+        "lexicon": NimbleNetTensor(
+            data: lexiconJson,
+            dataType: .json,
+            shape: nil
+        )
+    ]
+)
+
+// Generate speech from text
+let speechResult = NimbleNet.runMethod(
+    "run_text_to_speech_model",
+    inputs: [
+        "text": NimbleNetTensor(
+            data: text,
+            dataType: .string,
+            shape: nil
+        )
+    ]
+)
+let audioData = speechResult["audio"]!.data as! Data
+
+// Send user query to LLM
+NimbleNet.runMethod(
+    "prompt_llm",
+    inputs: [
+        "query": NimbleNetTensor(
+            data: query,
+            dataType: .string,
+            shape: nil
+        ),
+        "is_voice_initiated": NimbleNetTensor(
+            data: isVoiceInitiated ? 1 : 0,
+            dataType: .int32,
+            shape: nil
+        )
+    ]
+)
+
+// Get next chunk of LLM response
+let responseChunk = NimbleNet.runMethod(
+    "get_next_str",
+    inputs: [:]
+)
+let text = responseChunk["str"]!.data as! String
+let isFinished = (responseChunk["finished"]?.data as? Bool) ?? false
+
+// Set conversation history context
+let messageArray = messages.map { message -> [String: String] in
+    return [
+        "type": message.type, // "user" or "assistant"
+        "message": message.content
+    ]
+}
+
+NimbleNet.runMethod(
+    "set_context",
+    inputs: [
+        "context": NimbleNetTensor(
+            data: messageArray,
+            dataType: .jsonArray,
+            shape: [messageArray.count]
+        )
+    ]
+)
+```
+
 
 ## ONNX Export and Inference
 

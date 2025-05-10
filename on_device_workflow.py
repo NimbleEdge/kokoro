@@ -1,34 +1,195 @@
 """
-Python implementation for the on-device G2P tokenizer of Kokoro
+Python implementation for the on-device G2P tokenizer and workflow utilities of Kokoro
 
-This tokenizer converts text into phonetic representations (phonemes) for use in 
-text-to-speech systems. The main steps in the process are:
-1. Preprocessing - handle special cases like currencies, numbers, times
-2. Tokenization - split text into meaningful tokens
-3. Phonemization - convert tokens to phonetic representations 
-4. Stress application - add proper stress markers to phonemes
+This script provides a complete on-device workflow for:
+
+1. Text-to-Speech Generation:
+   - Tokenization: Convert text into phonetic representations
+     a. Preprocessing - handle special cases like currencies, numbers, times
+     b. Tokenization - split text into meaningful tokens
+     c. Phonemization - convert tokens to phonetic representations 
+     d. Stress application - add proper stress markers to phonemes
+   - Audio Generation: Convert phonemes to high-quality speech
+
+2. Language Model Integration:
+   - User Query Processing: Send user text to the LLM
+   - Response Streaming: Get text responses as they're generated
+   - Context Management: Maintain conversation history for contextual replies
+   
+Key Entry Points for Native Apps:
+- run_text_to_speech_model: Convert text to speech audio
+- prompt_llm: Send user input to the LLM
+- get_next_str: Retrieve streaming LLM responses
+- set_context: Set conversation history
+- init: Initialize the model with a custom lexicon
+
+Each of these functions accepts a dictionary (HashMap) of parameters and returns 
+a dictionary of results, making them easy to call from Kotlin/Swift.
 """
-import re
-import json
-from phonemizer.backend import EspeakBackend
+from nimbleedge import ne_re as re
+from nimbleedge import nimblenet as nm
 
-# Initialize espeak backend for English (US) phonemization
-backend = EspeakBackend('en-us')
-# Define stress markers and vowel phonemes for stress placement
+# Get hardware information and optimize thread usage for model performance
+hardware_info = nm.get_hardware_info()
+num_cores  = int(hardware_info["numCores"])
+nm.set_xnnpack_num_threads(num_cores / 2  + 1)
+
+# Initialize models - kokoro for text-to-speech and llama-3 for LLM responses
+kokoro_model = nm.Model("kokoro_")
+llm = nm.llm("llama-3_")
+
+# Phoneme-related constants for stress markers and vowel sounds
 STRESSES = 'ˌˈ'
 PRIMARY_STRESS = STRESSES[1]
 SECONDARY_STRESS = STRESSES[0]
 VOWELS = ['A', 'I', 'O', 'Q', 'W', 'Y', 'a', 'i', 'u', 'æ', 'ɑ', 'ɒ', 'ɔ', 'ə', 'ɛ', 'ɜ', 'ɪ', 'ʊ', 'ʌ', 'ᵻ']
 
-# Characters to ignore during tokenization and punctuation for special handling
+# Tokenization and punctuation constants
 SUBTOKEN_JUNKS = "',-._''/' "
 PUNCTS = ['?', ',', ';', '"', '—', ':', '!', '.', '…', '"', '"']
 NON_QUOTE_PUNCTS = ['?', ',', '—', '.', ':', '!', ';', '…']
-
-# Optional lexicon for custom word-to-phoneme mappings
 LEXICON = None
 
-# Currency symbols and their word representations
+# Global variables for handling the text stream and LLM state
+text_stream = None
+IS_LLM_INITIATED = False
+
+# LLM prompt formatting constants
+SYSTEM_PROMPT_BEGIN = "<|start_header_id|>system<|end_header_id|>"
+SYSTEM_PROMPT_TEXT = """You are NimbleEdge AI, a chatbot running on device using the NimbleEdge platform. Keep answers short and concise."""
+PROMPT_END = "<|eot_id|>\n"
+SYSTEM_PROMPT = SYSTEM_PROMPT_BEGIN + SYSTEM_PROMPT_TEXT + PROMPT_END
+
+# Additional prompt for voice-initiated queries
+ASR_DYNAMIC_SUB_PROMPT = """ Answer the user query in less than 30 words. Keep the chat fun and engaging."""
+
+# Message formatting constants
+USER_PROMPT_BEGIN = "<|start_header_id|>user<|end_header_id|>"
+ASSISTANT_RESPONSE_BEGIN = "<|start_header_id|>assistant<|end_header_id|>"
+MAX_TOKEN_CONTEXT = 2000
+
+# Mapping from phoneme characters to integer IDs for the model
+PHONEME_TO_ID = {
+    ";": 1,
+    ":": 2,
+    ",": 3,
+    ".": 4,
+    "!": 5,
+    "?": 6,
+    "—": 9,
+    "…": 10,
+    "\"": 11,
+    "(": 12,
+    ")": 13,
+    """: 14,
+    """: 15,
+    " ": 16,
+    "\u0303": 17,
+    "ʣ": 18,
+    "ʥ": 19,
+    "ʦ": 20,
+    "ʨ": 21,
+    "ᵝ": 22,
+    "\uAB67": 23,
+    "A": 24,
+    "I": 25,
+    "O": 31,
+    "Q": 33,
+    "S": 35,
+    "T": 36,
+    "W": 39,
+    "Y": 41,
+    "ᵊ": 42,
+    "a": 43,
+    "b": 44,
+    "c": 45,
+    "d": 46,
+    "e": 47,
+    "f": 48,
+    "h": 50,
+    "i": 51,
+    "j": 52,
+    "k": 53,
+    "l": 54,
+    "m": 55,
+    "n": 56,
+    "o": 57,
+    "p": 58,
+    "q": 59,
+    "r": 60,
+    "s": 61,
+    "t": 62,
+    "u": 63,
+    "v": 64,
+    "w": 65,
+    "x": 66,
+    "y": 67,
+    "z": 68,
+    "ɑ": 69,
+    "ɐ": 70,
+    "ɒ": 71,
+    "æ": 72,
+    "β": 75,
+    "ɔ": 76,
+    "ɕ": 77,
+    "ç": 78,
+    "ɖ": 80,
+    "ð": 81,
+    "ʤ": 82,
+    "ə": 83,
+    "ɚ": 85,
+    "ɛ": 86,
+    "ɜ": 87,
+    "ɟ": 90,
+    "ɡ": 92,
+    "ɥ": 99,
+    "ɨ": 101,
+    "ɪ": 102,
+    "ʝ": 103,
+    "ɯ": 110,
+    "ɰ": 111,
+    "ŋ": 112,
+    "ɳ": 113,
+    "ɲ": 114,
+    "ɴ": 115,
+    "ø": 116,
+    "ɸ": 118,
+    "θ": 119,
+    "œ": 120,
+    "ɹ": 123,
+    "ɾ": 125,
+    "ɻ": 126,
+    "ʁ": 128,
+    "ɽ": 129,
+    "ʂ": 130,
+    "ʃ": 131,
+    "ʈ": 132,
+    "ʧ": 133,
+    "ʊ": 135,
+    "ʋ": 136,
+    "ʌ": 138,
+    "ɣ": 139,
+    "ɤ": 140,
+    "χ": 142,
+    "ʎ": 143,
+    "ʒ": 147,
+    "ʔ": 148,
+    "ˈ": 156,
+    "ˌ": 157,
+    "ː": 158,
+    "ʰ": 162,
+    "ʲ": 164,
+    "↓": 169,
+    "→": 171,
+    "↗": 172,
+    "↘": 173,
+    "ᵻ": 177
+  }
+# PUNCT_TAGS = [".",",","-LRB-","-RRB-","``",'""',"''",":","$","#",'NFP']
+# PUNCT_TAG_PHONEMES = {'-LRB-':'(', '-RRB-':')', '``':'"', '""':'"', "''":'"'}
+
+print(PRIMARY_STRESS, SECONDARY_STRESS, VOWELS, PUNCTS, NON_QUOTE_PUNCTS)
+
 CURRENCIES = {
     '$': ('dollar', 'cent'),
     '£': ('pound', 'pence'),
@@ -39,68 +200,30 @@ currency_symbols = r'[' + r''.join([re.escape(symbol) for symbol in CURRENCIES.k
 punct_symbols = r'[' + ''.join([re.escape(p) for p in PUNCTS]) + ']'
 LINK_REGEX = r"\[([^\]]+)\]\(([^\)]*)\)"
 
-# Helper functions for list operations
+# Helper functions for the tokenizer implementation
+
 def all(iterable):
-    """
-    Check if all elements in the iterable are True.
-    
-    Args:
-        iterable: Collection of elements to check
-        
-    Returns:
-        bool: True if all elements are True, False otherwise
-    """
     for item in iterable:
         if not item:
             return False
     return True
 
+
 def any(iterable):
-    """
-    Check if any element in the iterable is True.
-    
-    Args:
-        iterable: Collection of elements to check
-        
-    Returns:
-        bool: True if any element is True, False otherwise
-    """
     for item in iterable:
         if item:
             return True
     return False
 
-# Text manipulation functions
+
 def replace(text, original, replacement):
-    """
-    Replace all occurrences of original with replacement in text.
-    Works from right to left to avoid index issues.
-    
-    Args:
-        text (str): The text to modify
-        original (str): The substring to replace
-        replacement (str): The replacement string
-        
-    Returns:
-        str: Text with all occurrences of original replaced with replacement
-    """
     matches = [m for m in re.finditer(re.escape(original), text)]
     for match in matches[::-1]:
         text = text[:match.start()]+replacement+text[match.end():]
     return text
 
+
 def split(text, delimiter, is_regex):
-    """
-    Split text by delimiter, optionally treating delimiter as regex.
-    
-    Args:
-        text (str): The text to split
-        delimiter (str): The delimiter to split by
-        is_regex (bool): Whether to treat delimiter as regex pattern
-        
-    Returns:
-        list: List of substrings split by delimiter
-    """
     delimiter_pattern = delimiter
     if not is_regex:
         delimiter_pattern = re.escape(delimiter)
@@ -119,18 +242,8 @@ def split(text, delimiter, is_regex):
         curIdx = curIdx + delimiter_position + len(delimiter)
     return result + [text[curIdx:]]
 
+
 def split_with_delimiters_seperate(text, delimiter, is_regex):
-    """
-    Split text by delimiter, keeping delimiters as separate items.
-    
-    Args:
-        text (str): The text to split
-        delimiter (str): The delimiter to split by
-        is_regex (bool): Whether to treat delimiter as regex pattern
-        
-    Returns:
-        list: List of substrings with delimiters as separate items
-    """
     delimiter_pattern = delimiter
     if not is_regex:
         delimiter_pattern = re.escape(delimiter)
@@ -153,33 +266,12 @@ def split_with_delimiters_seperate(text, delimiter, is_regex):
         result.append(text[curIdx:])
     return result
 
+
 def isspace(input):
-    """
-    Check if the input string contains only whitespace characters.
-    
-    Args:
-        input (str): String to check
-        
-    Returns:
-        bool: True if string contains only whitespace, False otherwise
-    """
     return all([c in [' ', '\t', '\n', '\r'] for c in input])
 
-# Token class to represent processed text with phonetic and stress information
 class Token:
-    """
-    Object representing a token with phonetic and stress information.
     
-    Attributes:
-        text (str): The original text
-        whitespace (str): Whitespace following this token
-        phonemes (str): Phonetic representation
-        stress (int/float/None): Stress level indicator
-        currency (str/None): Currency information if applicable
-        prespace (bool): Whether token should be preceded by space
-        alias (str/None): Alternative representation if specified
-        is_head (bool): Whether this is the first token in a word
-    """
     def __init__(self, text, whitespace, phonemes, stress, currency, prespace, alias, is_head):
         self.text = text
         self.whitespace = whitespace
@@ -190,17 +282,23 @@ class Token:
         self.alias = alias
         self.is_head = is_head
 
+    
 def merge_tokens(tokens, unk):
     """
-    Merge multiple tokens into a single token while preserving phonemes and stress.
-    Handles proper spacing between phonemes when merging.
+    Merge multiple Token objects into a single Token, combining their phonemes.
     
     Args:
         tokens (list): List of Token objects to merge
-        unk (str): Unknown token placeholder (not used in current implementation)
+        unk (str): Placeholder for unknown tokens (not currently used)
         
     Returns:
         Token: A single merged Token object
+        
+    Logic:
+        1. Collect stress information from all tokens
+        2. Combine phonemes with appropriate spacing
+        3. Remove leading spaces
+        4. Inherit properties from component tokens
     """
     stress = [t.stress for t in tokens if t.stress is not None]
     phonemes = ""
@@ -211,7 +309,9 @@ def merge_tokens(tokens, unk):
             phonemes = phonemes
         else:
             phonemes = phonemes + t.phonemes
+    print("final phonemes", phonemes)
     if isspace(phonemes[0]):
+        print("deleting space")
         phonemes = phonemes[1:]
     stress_token = None
     if len(stress) == 1:
@@ -227,23 +327,20 @@ def merge_tokens(tokens, unk):
         tokens[0].is_head,
     )
 
+
 def apply_stress(ps, stress):
     """
     Apply stress to phonemes.
     
     Args:
-        ps (str): The phoneme string
-        stress (int/float/None): Stress level indicator:
-            - None: Keep stress as is
-            - < -1: Remove all stress
-            - -1: Convert primary stress to secondary
-            - 0, 0.5: Convert primary to secondary if exists, else add secondary
-            - 1: Convert secondary to primary if exists, else no change
-            - > 1: Add primary stress if no stress exists
-                
+        ps: The phoneme string
+        stress: Stress level - can be numeric (1 for primary, 0.5/0 for secondary, -1 for no stress)
+                or None to determine automatically based on content words
+    
     Returns:
-        str: Phonemes with appropriate stress markers applied
+        Phonemes with appropriate stress markers
     """
+    
     def restress(ps):
         ips = [(i, p) for i, p in enumerate(ps)]
         stresses = {i: next(j for j, v in ips[i:] if v in VOWELS) for i, p in ips if p in STRESSES}
@@ -272,16 +369,8 @@ def apply_stress(ps, stress):
         return restress(PRIMARY_STRESS + ps)
     return ps
 
+
 def stress_weight(ps):
-    """
-    Calculate the phonetic weight for stress purposes.
-    
-    Args:
-        ps (str): Phoneme string
-        
-    Returns:
-        int: Numeric weight based on phonemes (higher for certain vowels/phonemes)
-    """
     sum = 0
     if not ps:
         return 0
@@ -292,16 +381,9 @@ def stress_weight(ps):
             sum = sum + 1
     return sum
 
+
 def is_function_word(word):
-    """
-    Check if a word is a function word (articles, prepositions, conjunctions, etc.)
-    
-    Args:
-        word (str): Word to check
-        
-    Returns:
-        bool: True if the word is a function word, False otherwise
-    """
+    """Check if a word is a function word (articles, prepositions, conjunctions, etc.)"""
     function_words = [
         'a', 'an', 'the', 'in', 'on', 'at', 'of', 'for', 'with', 'by', 'to', 'from', 
         'and', 'or', 'but', 'nor', 'so', 'yet', 'is', 'am', 'are', 'was', 'were', 
@@ -315,43 +397,35 @@ def is_function_word(word):
         word = word[:-1]
     return word in function_words
 
+
 def isalpha_regex(text):
-    """
-    Check if string contains only alphabetic characters.
-    
-    Args:
-        text (str): String to check
-        
-    Returns:
-        bool: True if string contains only alphabetic characters, False otherwise
-    """
+    """Check if string contains only alphabetic characters."""
     if not text:  # Handle empty string
         return False
     return bool(re.match(r'^[a-zA-Z]+$', text))
 
+
 def is_content_word(word):
-    """
-    Check if a word is a content word (nouns, verbs, adjectives, adverbs).
-    
-    Args:
-        word (str): Word to check
-        
-    Returns:
-        bool: True if the word is a content word, False otherwise
-    """
+    """Check if a word is a content word (nouns, verbs, adjectives, adverbs)"""
     return not is_function_word(word) and len(word) > 2 and isalpha_regex(word)
+
 
 def resolve_tokens(tokens):
     """
-    Apply stress and formatting to match G2P output format.
-    G2P places primary stress markers directly before vowels, not at the beginning of words.
-    This ensures phonemes are properly formatted with appropriate stress placement.
+    Apply stress patterns and format the phoneme string according to G2P conventions.
     
     Args:
-        tokens (list): List of Token objects to resolve
+        tokens (list): List of Token objects with phoneme information
         
     Returns:
-        str: Final phoneme string with proper stress placement and formatting
+        str: Final phoneme string with appropriate stress markers and spacing
+        
+    Logic:
+        1. Apply phoneme corrections to standardize representation
+        2. Handle special word cases
+        3. Apply appropriate stress to content words and multi-word expressions
+        4. Add proper spaces between tokens
+        5. Handle punctuation correctly
     """
     # G2P phoneme mapping corrections
     phoneme_corrections = {
@@ -370,6 +444,7 @@ def resolve_tokens(tokens):
     # Define sentence-ending punctuation
     sentence_ending_punct = ['.', '!', '?']
 
+    
     def add_stress_before_vowel(phoneme, stress_marker):
         """Add stress marker directly before the first vowel in the phoneme string"""
         phoneme_chars = [c for c in phoneme]
@@ -474,16 +549,8 @@ def resolve_tokens(tokens):
     final_result = "".join(result)
     return final_result
 
+
 def remove_commas_between_digits(text):
-    """
-    Remove commas between digits in numbers (e.g., 1,000 → 1000).
-    
-    Args:
-        text (str): Input text containing numbers with commas
-        
-    Returns:
-        str: Text with commas removed from between digits
-    """
     pattern = r'(^|[^\d])(\d+(?:,\d+)*)([^\d]|$)'
     matches = [match for match in re.finditer(pattern, text)]
     for match in matches[::-1]:
@@ -493,16 +560,24 @@ def remove_commas_between_digits(text):
         text = text[:match.start()] + updated_match_text + text[match.end():]
     return text
 
+
 def split_num(text):
     """
-    Process time expressions (like 2:30) and convert them to word form
-    (e.g., "2:30" → "2 30" or "2 o'clock" for whole hours).
+    Convert time expressions to their spoken form.
     
     Args:
-        text (str): Input text containing time expressions
+        text (str): Text containing time expressions (e.g., "2:30")
         
     Returns:
-        str: Text with time expressions marked for conversion
+        str: Text with time expressions marked with their spoken forms
+        
+    Logic:
+        1. Find time expressions using regex (hours:minutes format)
+        2. Handle special cases:
+           - Whole hours as "X o'clock"
+           - Minutes less than 10 as "oh X" (e.g., 2:05 → "2 oh 5")
+           - Regular times as "hour minute" (e.g., 2:30 → "2 30")
+        3. Add annotation in [original](spoken form) format
     """    
     split_num_pattern = r"\b(?:[1-9]|1[0-2]):[0-5]\d\b"
     matches = [match for match in re.finditer(split_num_pattern, text)]
@@ -523,16 +598,9 @@ def split_num(text):
         text = text[:match.start()] + "["+original+"]("+transformed+")" + text[match.end():]
     return text
 
+
 def convert_numbers_to_words(text):
-    """
-    Convert numbers to their spoken form (e.g., years, hundreds).
-    
-    Args:
-        text (str): Input text containing numbers
-        
-    Returns:
-        str: Text with numbers marked for conversion to spoken form
-    """
+    # # Convert number to words (simplified implementation)
     split_num_pattern = r"\b[0-9]+\b"
     matches = [match for match in re.finditer(split_num_pattern, text)]
     transformed = ""
@@ -558,17 +626,24 @@ def convert_numbers_to_words(text):
         else:
             return text
 
+
 def flip_money(text):
     """
-    Convert currency expressions to their spoken form
-    (e.g., "$5.25" → "5 dollars and 25 cents").
+    Convert currency expressions to their spoken form with formatting annotations.
     
     Args:
-        text (str): Input text containing currency expressions
+        text (str): Text containing currency expressions
         
     Returns:
-        str: Text with currency expressions marked for conversion
+        str: Text with currency expressions marked with their spoken forms
+        
+    Logic:
+        1. Find currency expressions using regex
+        2. Extract currency symbol and value
+        3. Format currency as words based on amount (singular/plural)
+        4. Add annotation in [original](spoken form) format
     """
+    # Handle case when match_obj is a re.Match object
     currency_pattern = r"[\\$£€]\d+(?:\.\d+)?(?: hundred| thousand| (?:[bm]|tr)illion)*\b|[\\$£€]\d+\.\d\d?\b"
     matches = [match for match in re.finditer(currency_pattern, text)]
     for match in matches[::-1]:
@@ -601,16 +676,22 @@ def flip_money(text):
         text = text[:match.start()] + "["+match_text+"]("+transformed+")" + text[match.end():]
     return text
 
+
 def point_num(text):
     """
-    Convert decimal numbers to spoken form with "point"
-    (e.g., "3.14" → "3 point 1 4").
+    Convert decimal numbers to their spoken form with "point" notation.
     
     Args:
-        text (str): Input text containing decimal numbers
+        text (str): Text containing decimal numbers
         
     Returns:
-        str: Text with decimal numbers marked for conversion
+        str: Text with decimal numbers marked with their spoken forms
+        
+    Logic:
+        1. Find decimal numbers using regex
+        2. Split number at decimal point
+        3. Format as "[number] point [digits]" where digits are read individually
+        4. Add annotation in [original](spoken form) format
     """
     split_num_pattern = r"\b\d*\.\d+\b"
     matches = [match for match in re.finditer(split_num_pattern, text)]
@@ -625,14 +706,10 @@ def point_num(text):
     return text
 
 
+
 def preprocess(text):
     """
-    Prepare text for tokenization by handling special cases:
-    1. Remove commas in numbers
-    2. Convert ranges (e.g., 5-10 to 5 to 10)
-    3. Process currency values
-    4. Handle time expressions
-    5. Process decimal numbers
+    Prepare text for phonemization by handling special cases like numbers, ranges, and currency.
     
     Args:
         text (str): Raw input text
@@ -640,10 +717,18 @@ def preprocess(text):
     Returns:
         tuple: (
             str: Preprocessed text,
-            list: Tokens extracted from text,
+            list: Tokens extracted from text, 
             dict: Features for special handling indexed by token position,
             list: Indices of non-string features
         )
+        
+    Logic:
+        1. Remove commas between digits (e.g., 1,000 → 1000)
+        2. Convert ranges (e.g., 5-10 → 5 to 10)
+        3. Format currency expressions (e.g., $5.25 → 5 dollars and 25 cents)
+        4. Process time expressions (e.g., 2:30 → 2 30)
+        5. Format decimal numbers (e.g., 3.14 → 3 point 1 4)
+        6. Process explicit phonetic specifications in [text](/phoneme/) format
     """
     result = ''
     tokens = []
@@ -681,6 +766,7 @@ def preprocess(text):
         # or explicit like [Kokoro](/kˈOkəɹO/)
         is_alias = False
         f = ""
+        
         def is_signed(s):
             if s[0] == '-' or s[0] == '+':
                 return bool(re.match(r'^[0-9]+$', s[1:]))
@@ -727,15 +813,20 @@ def preprocess(text):
         tokens = tokens + split(text[last_end:], r' ', False)
     return result, tokens, features, nonStringFeatureIndexList
 
+
 def split_puncts(text):
     """
-    Split text by punctuation marks, keeping the punctuation as separate tokens.
+    Split text by punctuation marks while preserving the punctuation.
     
     Args:
-        text (str): Input text to split
+        text (str): Input text to be split
         
     Returns:
-        list: List of tokens with punctuation as separate items
+        list: Text split into tokens with punctuation preserved as separate tokens
+        
+    Logic:
+        Iterates through each punctuation mark and splits the text whenever the 
+        punctuation mark is found, keeping the punctuation as a separate token.
     """
     splits = [text]
     for punct in PUNCTS:
@@ -748,21 +839,26 @@ def split_puncts(text):
                     splits = splits[:idx] + res + splits[idx+1:]
     return splits
 
+
 def tokenize(tokens, features, nonStringFeatureIndexList):
     """
-    Convert preprocessed text into Token objects with phonemes.
-    This is the core tokenization function that:
-    1. Handles phoneme generation for each token
-    2. Processes special cases using features from preprocessing
-    3. Merges multi-word tokens appropriately
+    Convert preprocessed text tokens into Token objects with phonetic information.
     
     Args:
-        tokens (list): List of token strings from preprocessing
-        features (dict): Special features indexed by token position
-        nonStringFeatureIndexList (list): Indices of non-string features
+        tokens (list): List of string tokens from preprocessing
+        features (dict): Special features keyed by token position
+        nonStringFeatureIndexList (list): Indices of tokens with non-string features
         
     Returns:
         list: List of Token objects with phonetic information
+        
+    Logic:
+        1. Skip junk tokens
+        2. Handle explicit phoneme specifications
+        3. Process tokens with aliases/replacements
+        4. Split tokens that contain punctuation
+        5. Generate phonemes using lexicon or text-to-phoneme conversion
+        6. Merge multi-word tokens
     """
     mutable_tokens = []
     for i, word in enumerate(tokens):
@@ -801,13 +897,16 @@ def tokenize(tokens, features, nonStringFeatureIndexList):
                     phoneme = tok
                     whitespace=False
                 elif LEXICON is not None and tok in LEXICON:
+                    print("found tok", tok, LEXICON[tok])
                     phoneme = LEXICON[tok]
                 else:
                     tok_lower = tok.lower()
                     if LEXICON is not None and tok_lower in LEXICON:
+                        print("found tok", tok_lower, LEXICON[tok_lower])
                         phoneme = LEXICON[tok_lower]
                     else:
-                        phoneme = backend.phonemize([tok_lower], strip=True)[0]
+                        print("not found tok lower:"+ tok_lower+ "tok:"+tok)
+                        phoneme = nm.convertTextToPhonemes(tok_lower)
                 stress = None
                 if feature is not None and not i in nonStringFeatureIndexList:
                     stress = feature
@@ -820,41 +919,269 @@ def tokenize(tokens, features, nonStringFeatureIndexList):
                 word_tokens.append(token)
             word_tokens[-1].whitespace = ''
             word_tokens[0].prespace = False
+            print("word_tokens", [t.phonemes for t in word_tokens])
             mutable_tokens.append(merge_tokens(word_tokens, " "))
     return mutable_tokens
 
+
 def phonemize(text):
     """
-    Main function to convert text to phonemes.
-    
-    The process follows these steps:
-    1. Preprocess text to handle special cases (currencies, times, numbers)
-    2. Tokenize the preprocessed text into Token objects
-    3. Resolve tokens to apply proper stress and formatting
+    Convert text to phonemes using the preprocessing, tokenization, and stress resolution pipeline.
     
     Args:
         text (str): The input text to convert to phonemes
     
     Returns:
-        dict: Dictionary with:
-            - 'ps': Processed phoneme string with stress marks
-            - 'tokens': List of Token objects used for generation
+        dict: Dictionary containing:
+            - ps (str): The final phonetic string with proper stress markers
+            - tokens (list): The token objects used for phonemization
+            
+    Logic:
+        1. Preprocess text to handle special cases (numbers, currency, etc.)
+        2. Convert preprocessed tokens to phonemes
+        3. Apply appropriate stress patterns and formatting
     """
     _, tokens, features, nonStringFeatureIndexList = preprocess(text)
+    print("tokens", [t for t in tokens], "features", features, nonStringFeatureIndexList)
     tokens = tokenize(tokens, features, nonStringFeatureIndexList)   
-    result = resolve_tokens(tokens)
-    print("Result Phonemes", result)
+    print("tokens after tokenize", [t.phonemes for t in tokens]) 
+    result = resolve_tokens(tokens)    
     return {"ps": result, "tokens": tokens}
 
-def set_lexicon(lexicon):
+
+def run_text_to_speech_model(input):
     """
-    Set a custom lexicon for word-to-phoneme mappings.
+    Convert text to speech using the Kokoro model called from Kotlin/iOS applications.
     
     Args:
-        lexicon (dict): Dictionary mapping words to their phoneme representations
+        input (dict): A dictionary containing:
+            - text (str): The text to convert to speech
     
     Returns:
-        None: Updates the global LEXICON variable
+        dict: A dictionary containing:
+            - audio (bytes): The generated audio data
+    
+    Process:
+    1. Convert input text to phonemes
+    2. Map phonemes to token IDs
+    3. Run the Kokoro model to generate audio
+    4. Return the audio data
     """
-    LEXICON = lexicon
-    print("LEXICON Sample keys", list(LEXICON.keys())[:10])
+    # text = "How could I know? It's an unanswerable question. Like asking an unborn child if they'll lead a good life. They haven't even been born."
+    phonemes = phonemize(input["text"])["ps"]
+    tokens = []
+    for p in phonemes:
+        if PHONEME_TO_ID.has_key(p):
+            tokens.append(PHONEME_TO_ID[p])
+        else:
+            tokens.append(0)
+    tokens = [0] + tokens + [0]
+    if len(tokens) > 510:
+        tokens = tokens[:510]
+
+    input_ids = nm.tensor([[0] + tokens + [0]], "int64")
+    speed = nm.tensor([1.0], "float")
+    audio = kokoro_model.run(input_ids, speed)
+    return {"audio": audio[0][0]}
+
+def init(input):
+    """
+    Initialize the model with a custom lexicon for phoneme mapping called from Kotlin/iOS applications.
+    
+    Args:
+        input (dict): A dictionary containing:
+            - lexicon (dict): A dictionary mapping words to their phonetic representations
+    
+    Returns:
+        dict: An empty dictionary
+    
+    Side effects:
+        Sets the global LEXICON variable used for phoneme lookups
+    """
+    LEXICON = input["lexicon"]
+    print(LEXICON["'Merica"])
+    return {}
+
+def estimate_tokens_by_words(prompt):
+    """
+    Estimate the number of tokens in a text based on word count.
+    
+    Args:
+        prompt (str): Text to estimate token count for
+        
+    Returns:
+        int: Estimated number of tokens
+        
+    Logic:
+        1. Count words using regex
+        2. Apply a multiplier (1.33) to convert words to estimated tokens
+        3. Convert to integer
+    """
+    # Count words in the prompt
+    word_count = len(re.findall(r"\b\w+\b", prompt))
+    # Estimate tokens (1 word ~ 1.33 tokens)
+    estimated_tokens = int(word_count * 1.33)
+    return estimated_tokens
+
+
+SYSTEM_PROMPT_TOKENS = estimate_tokens_by_words(SYSTEM_PROMPT)
+messages = []
+
+def llm_cancel(inp):
+    """
+    Cancel the current LLM generation process.
+    
+    Args:
+        inp (dict): Input dictionary (not used)
+        
+    Returns:
+        dict: Empty dictionary
+        
+    Side effects:
+        - Cancels the current LLM generation
+        - Resets the text_stream to None
+    """
+    llm.cancel()
+    text_stream = None
+    return {}
+
+def clear_prompt(inp):
+    """
+    Clear the LLM context and reset state variables.
+    
+    Args:
+        inp (dict): Input dictionary (not used)
+        
+    Returns:
+        dict: Empty dictionary
+        
+    Side effects:
+        - Clears the LLM context
+        - Resets the text_stream to None
+        - Resets the IS_LLM_INITIATED flag
+    """
+    llm.clear_context()
+    text_stream = None
+    IS_LLM_INITIATED = False
+    return {}
+
+
+def prompt_llm(inp):
+    """
+    Process a user query and generate an LLM response called from Kotlin/iOS applications.
+    
+    Args:
+        inp (dict): A dictionary containing:
+            - query (str): The user's text query
+            - is_voice_initiated (bool): Whether the query came from voice input
+    
+    Returns:
+        dict: An empty dictionary (responses are retrieved via get_next_str)
+    
+    Side effects:
+        - Sets up the prompt with appropriate system context
+        - Initiates LLM generation that can be retrieved via get_next_str
+        - Updates the global text_stream variable
+    
+    Note:
+        For voice-initiated queries, the system adds a special prompt to keep
+        responses shorter and more engaging.
+    """
+    # Re-init variables
+    text_stream = None
+    query = inp["query"]
+    sys_prompt = ""
+    is_voice_initiated  = inp["is_voice_initiated"]
+    if not IS_LLM_INITIATED:
+        sys_prompt = SYSTEM_PROMPT_TEXT
+        IS_LLM_INITIATED = True
+        print("sys_prompt", sys_prompt)
+    if is_voice_initiated:
+        sys_prompt = SYSTEM_PROMPT_BEGIN + sys_prompt + ASR_DYNAMIC_SUB_PROMPT + PROMPT_END
+    
+    final_prompt = sys_prompt + USER_PROMPT_BEGIN + query + PROMPT_END + ASSISTANT_RESPONSE_BEGIN
+    print("final_prompt", final_prompt)
+    text_stream = llm.prompt(final_prompt)
+    return {}
+
+
+current_response = ""
+
+
+def get_next_str(inp):
+    """
+    Retrieve the next chunk of text from the LLM's response stream called from Kotlin/iOS applications.
+    
+    Args:
+        inp (dict): An empty dictionary (no input needed)
+    
+    Returns:
+        dict: A dictionary containing:
+            - str (str): The next chunk of generated text
+            - finished (bool): True if the generation is complete, False otherwise
+    
+    Side effects:
+        - Updates the global current_response variable to accumulate the full response
+        - Resets current_response to empty when generation is finished
+    
+    Note:
+        The client application should call this repeatedly until finished=True to
+        get the complete response in a streaming manner.
+    """
+    if text_stream is None:
+        return {"finished": True, "str":""}
+    
+    if text_stream is not None and text_stream.finished():
+        strOut = text_stream.next()
+        current_response = current_response + strOut
+        # print("Text stream finished")
+        current_response = ""
+        return {"finished": True, "str":strOut}
+
+    strOut = text_stream.next()
+    current_response = current_response + strOut
+    return {"str": strOut}
+
+
+def set_context(inp):
+    """
+    Set the conversation history context for the LLM called from Kotlin/iOS applications.       
+    Args:
+        inp (dict): A dictionary containing:
+            - context (list): A list of message dictionaries, each with:
+                - type (str): Either "user" or "assistant"
+                - message (str): The content of the message
+    
+    Returns:
+        dict: An empty dictionary
+    
+    Side effects:
+        - Clears the current LLM context
+        - Builds a properly formatted prompt from the conversation history
+        - Sets this as the new context for the LLM
+    
+    Note:
+        The context is processed in reverse order (newest first) and truncated if
+        it exceeds MAX_TOKEN_CONTEXT to prevent exceeding model context limits.
+    """
+    llm.clear_context()
+    final_prompt = ""
+    for message_dict in inp["context"][::-1]:
+        type = message_dict["type"]
+        message = message_dict["message"]
+        if len(final_prompt) + len(message) > MAX_TOKEN_CONTEXT:
+            substring_len = MAX_TOKEN_CONTEXT - len(final_prompt)
+            start_idx = len(message) - substring_len
+            final_prompt = USER_PROMPT_BEGIN +  message[start_idx:] + PROMPT_END +  final_prompt
+            break
+        if type == "user":
+            final_prompt = USER_PROMPT_BEGIN + message + PROMPT_END + final_prompt
+        elif type == "assistant":
+            final_prompt = ASSISTANT_RESPONSE_BEGIN + message + PROMPT_END + final_prompt
+        else:
+            raise "type should be user or assistant to set context"
+    
+    final_prompt = SYSTEM_PROMPT + final_prompt
+    print("final_prompt set context", final_prompt)
+    llm.add_context(final_prompt)
+    return {}
