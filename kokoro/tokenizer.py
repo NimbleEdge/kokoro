@@ -1,24 +1,34 @@
-#!/usr/bin/env python3
 """
-Python implementation of the tokenizer for ONNX models.
-Converted from JavaScript to be compatible with Python-based ONNX implementations.
+Python implementation foor the on-device G2P tokenizer of Kokoro
+
+This tokenizer converts text into phonetic representations (phonemes) for use in 
+text-to-speech systems. The main steps in the process are:
+1. Preprocessing - handle special cases like currencies, numbers, times
+2. Tokenization - split text into meaningful tokens
+3. Phonemization - convert tokens to phonetic representations 
+4. Stress application - add proper stress markers to phonemes
 """
 import re
 import json
 from phonemizer.backend import EspeakBackend
 
+# Initialize espeak backend for English (US) phonemization
 backend = EspeakBackend('en-us')
+# Define stress markers and vowel phonemes for stress placement
 STRESSES = 'ˌˈ'
 PRIMARY_STRESS = STRESSES[1]
 SECONDARY_STRESS = STRESSES[0]
 VOWELS = ['A', 'I', 'O', 'Q', 'W', 'Y', 'a', 'i', 'u', 'æ', 'ɑ', 'ɒ', 'ɔ', 'ə', 'ɛ', 'ɜ', 'ɪ', 'ʊ', 'ʌ', 'ᵻ']
 
-SUBTOKEN_JUNKS = "',-._'’/' "
-PUNCTS = ['?', ',', ';', '“', '—', ':', '!', '.', '…', '"', '”']
+# Characters to ignore during tokenization and punctuation for special handling
+SUBTOKEN_JUNKS = "',-._''/' "
+PUNCTS = ['?', ',', ';', '"', '—', ':', '!', '.', '…', '"', '"']
 NON_QUOTE_PUNCTS = ['?', ',', '—', '.', ':', '!', ';', '…']
 
+# Optional lexicon for custom word-to-phoneme mappings
 LEXICON = None
 
+# Currency symbols and their word representations
 CURRENCIES = {
     '$': ('dollar', 'cent'),
     '£': ('pound', 'pence'),
@@ -29,25 +39,68 @@ currency_symbols = r'[' + r''.join([re.escape(symbol) for symbol in CURRENCIES.k
 punct_symbols = r'[' + ''.join([re.escape(p) for p in PUNCTS]) + ']'
 LINK_REGEX = r"\[([^\]]+)\]\(([^\)]*)\)"
 
+# Helper functions for list operations
 def all(iterable):
+    """
+    Check if all elements in the iterable are True.
+    
+    Args:
+        iterable: Collection of elements to check
+        
+    Returns:
+        bool: True if all elements are True, False otherwise
+    """
     for item in iterable:
         if not item:
             return False
     return True
 
 def any(iterable):
+    """
+    Check if any element in the iterable is True.
+    
+    Args:
+        iterable: Collection of elements to check
+        
+    Returns:
+        bool: True if any element is True, False otherwise
+    """
     for item in iterable:
         if item:
             return True
     return False
 
+# Text manipulation functions
 def replace(text, original, replacement):
+    """
+    Replace all occurrences of original with replacement in text.
+    Works from right to left to avoid index issues.
+    
+    Args:
+        text (str): The text to modify
+        original (str): The substring to replace
+        replacement (str): The replacement string
+        
+    Returns:
+        str: Text with all occurrences of original replaced with replacement
+    """
     matches = [m for m in re.finditer(re.escape(original), text)]
     for match in matches[::-1]:
         text = text[:match.start()]+replacement+text[match.end():]
     return text
 
 def split(text, delimiter, is_regex):
+    """
+    Split text by delimiter, optionally treating delimiter as regex.
+    
+    Args:
+        text (str): The text to split
+        delimiter (str): The delimiter to split by
+        is_regex (bool): Whether to treat delimiter as regex pattern
+        
+    Returns:
+        list: List of substrings split by delimiter
+    """
     delimiter_pattern = delimiter
     if not is_regex:
         delimiter_pattern = re.escape(delimiter)
@@ -67,6 +120,17 @@ def split(text, delimiter, is_regex):
     return result + [text[curIdx:]]
 
 def split_with_delimiters_seperate(text, delimiter, is_regex):
+    """
+    Split text by delimiter, keeping delimiters as separate items.
+    
+    Args:
+        text (str): The text to split
+        delimiter (str): The delimiter to split by
+        is_regex (bool): Whether to treat delimiter as regex pattern
+        
+    Returns:
+        list: List of substrings with delimiters as separate items
+    """
     delimiter_pattern = delimiter
     if not is_regex:
         delimiter_pattern = re.escape(delimiter)
@@ -90,9 +154,32 @@ def split_with_delimiters_seperate(text, delimiter, is_regex):
     return result
 
 def isspace(input):
+    """
+    Check if the input string contains only whitespace characters.
+    
+    Args:
+        input (str): String to check
+        
+    Returns:
+        bool: True if string contains only whitespace, False otherwise
+    """
     return all([c in [' ', '\t', '\n', '\r'] for c in input])
 
+# Token class to represent processed text with phonetic and stress information
 class Token:
+    """
+    Object representing a token with phonetic and stress information.
+    
+    Attributes:
+        text (str): The original text
+        whitespace (str): Whitespace following this token
+        phonemes (str): Phonetic representation
+        stress (int/float/None): Stress level indicator
+        currency (str/None): Currency information if applicable
+        prespace (bool): Whether token should be preceded by space
+        alias (str/None): Alternative representation if specified
+        is_head (bool): Whether this is the first token in a word
+    """
     def __init__(self, text, whitespace, phonemes, stress, currency, prespace, alias, is_head):
         self.text = text
         self.whitespace = whitespace
@@ -104,6 +191,17 @@ class Token:
         self.is_head = is_head
 
 def merge_tokens(tokens, unk):
+    """
+    Merge multiple tokens into a single token while preserving phonemes and stress.
+    Handles proper spacing between phonemes when merging.
+    
+    Args:
+        tokens (list): List of Token objects to merge
+        unk (str): Unknown token placeholder (not used in current implementation)
+        
+    Returns:
+        Token: A single merged Token object
+    """
     stress = [t.stress for t in tokens if t.stress is not None]
     phonemes = ""
     for t in tokens:
@@ -134,12 +232,17 @@ def apply_stress(ps, stress):
     Apply stress to phonemes.
     
     Args:
-        ps: The phoneme string
-        stress: Stress level - can be numeric (1 for primary, 0.5/0 for secondary, -1 for no stress)
-                or None to determine automatically based on content words
-    
+        ps (str): The phoneme string
+        stress (int/float/None): Stress level indicator:
+            - None: Keep stress as is
+            - < -1: Remove all stress
+            - -1: Convert primary stress to secondary
+            - 0, 0.5: Convert primary to secondary if exists, else add secondary
+            - 1: Convert secondary to primary if exists, else no change
+            - > 1: Add primary stress if no stress exists
+                
     Returns:
-        Phonemes with appropriate stress markers
+        str: Phonemes with appropriate stress markers applied
     """
     def restress(ps):
         ips = [(i, p) for i, p in enumerate(ps)]
@@ -170,6 +273,15 @@ def apply_stress(ps, stress):
     return ps
 
 def stress_weight(ps):
+    """
+    Calculate the phonetic weight for stress purposes.
+    
+    Args:
+        ps (str): Phoneme string
+        
+    Returns:
+        int: Numeric weight based on phonemes (higher for certain vowels/phonemes)
+    """
     sum = 0
     if not ps:
         return 0
@@ -181,7 +293,15 @@ def stress_weight(ps):
     return sum
 
 def is_function_word(word):
-    """Check if a word is a function word (articles, prepositions, conjunctions, etc.)"""
+    """
+    Check if a word is a function word (articles, prepositions, conjunctions, etc.)
+    
+    Args:
+        word (str): Word to check
+        
+    Returns:
+        bool: True if the word is a function word, False otherwise
+    """
     function_words = [
         'a', 'an', 'the', 'in', 'on', 'at', 'of', 'for', 'with', 'by', 'to', 'from', 
         'and', 'or', 'but', 'nor', 'so', 'yet', 'is', 'am', 'are', 'was', 'were', 
@@ -196,19 +316,42 @@ def is_function_word(word):
     return word in function_words
 
 def isalpha_regex(text):
-    """Check if string contains only alphabetic characters."""
+    """
+    Check if string contains only alphabetic characters.
+    
+    Args:
+        text (str): String to check
+        
+    Returns:
+        bool: True if string contains only alphabetic characters, False otherwise
+    """
     if not text:  # Handle empty string
         return False
     return bool(re.match(r'^[a-zA-Z]+$', text))
 
 def is_content_word(word):
-    """Check if a word is a content word (nouns, verbs, adjectives, adverbs)"""
+    """
+    Check if a word is a content word (nouns, verbs, adjectives, adverbs).
+    
+    Args:
+        word (str): Word to check
+        
+    Returns:
+        bool: True if the word is a content word, False otherwise
+    """
     return not is_function_word(word) and len(word) > 2 and isalpha_regex(word)
 
 def resolve_tokens(tokens):
     """
     Apply stress and formatting to match G2P output format.
     G2P places primary stress markers directly before vowels, not at the beginning of words.
+    This ensures phonemes are properly formatted with appropriate stress placement.
+    
+    Args:
+        tokens (list): List of Token objects to resolve
+        
+    Returns:
+        str: Final phoneme string with proper stress placement and formatting
     """
     # G2P phoneme mapping corrections
     phoneme_corrections = {
@@ -332,6 +475,15 @@ def resolve_tokens(tokens):
     return final_result
 
 def remove_commas_between_digits(text):
+    """
+    Remove commas between digits in numbers (e.g., 1,000 → 1000).
+    
+    Args:
+        text (str): Input text containing numbers with commas
+        
+    Returns:
+        str: Text with commas removed from between digits
+    """
     pattern = r'(^|[^\d])(\d+(?:,\d+)*)([^\d]|$)'
     matches = [match for match in re.finditer(pattern, text)]
     for match in matches[::-1]:
@@ -343,13 +495,14 @@ def remove_commas_between_digits(text):
 
 def split_num(text):
     """
-    Helper function to split numbers into phonetic equivalents.
+    Process time expressions (like 2:30) and convert them to word form
+    (e.g., "2:30" → "2 30" or "2 o'clock" for whole hours).
     
     Args:
-        match_obj: The regex match object or the matched string.
-    
+        text (str): Input text containing time expressions
+        
     Returns:
-        The original text with phonetic equivalent in square brackets.
+        str: Text with time expressions marked for conversion
     """    
     split_num_pattern = r"\b(?:[1-9]|1[0-2]):[0-5]\d\b"
     matches = [match for match in re.finditer(split_num_pattern, text)]
@@ -371,7 +524,15 @@ def split_num(text):
     return text
 
 def convert_numbers_to_words(text):
-    # # Convert number to words (simplified implementation)
+    """
+    Convert numbers to their spoken form (e.g., years, hundreds).
+    
+    Args:
+        text (str): Input text containing numbers
+        
+    Returns:
+        str: Text with numbers marked for conversion to spoken form
+    """
     split_num_pattern = r"\b[0-9]+\b"
     matches = [match for match in re.finditer(split_num_pattern, text)]
     transformed = ""
@@ -399,15 +560,15 @@ def convert_numbers_to_words(text):
 
 def flip_money(text):
     """
-    Helper function to format monetary values.
+    Convert currency expressions to their spoken form
+    (e.g., "$5.25" → "5 dollars and 25 cents").
     
     Args:
-        match_obj: The regex match object or the matched string.
-    
+        text (str): Input text containing currency expressions
+        
     Returns:
-        The original text with formatted currency in square brackets.
+        str: Text with currency expressions marked for conversion
     """
-    # Handle case when match_obj is a re.Match object
     currency_pattern = r"[\\$£€]\d+(?:\.\d+)?(?: hundred| thousand| (?:[bm]|tr)illion)*\b|[\\$£€]\d+\.\d\d?\b"
     matches = [match for match in re.finditer(currency_pattern, text)]
     for match in matches[::-1]:
@@ -442,13 +603,14 @@ def flip_money(text):
 
 def point_num(text):
     """
-    Helper function to process decimal numbers.
+    Convert decimal numbers to spoken form with "point"
+    (e.g., "3.14" → "3 point 1 4").
     
     Args:
-        match_obj: The regex match object or the matched string.
-    
+        text (str): Input text containing decimal numbers
+        
     Returns:
-        The original text with formatted decimal in square brackets.
+        str: Text with decimal numbers marked for conversion
     """
     split_num_pattern = r"\b\d*\.\d+\b"
     matches = [match for match in re.finditer(split_num_pattern, text)]
@@ -464,6 +626,25 @@ def point_num(text):
 
 
 def preprocess(text):
+    """
+    Prepare text for tokenization by handling special cases:
+    1. Remove commas in numbers
+    2. Convert ranges (e.g., 5-10 to 5 to 10)
+    3. Process currency values
+    4. Handle time expressions
+    5. Process decimal numbers
+    
+    Args:
+        text (str): Raw input text
+        
+    Returns:
+        tuple: (
+            str: Preprocessed text,
+            list: Tokens extracted from text,
+            dict: Features for special handling indexed by token position,
+            list: Indices of non-string features
+        )
+    """
     result = ''
     tokens = []
     features = {}
@@ -547,6 +728,15 @@ def preprocess(text):
     return result, tokens, features, nonStringFeatureIndexList
 
 def split_puncts(text):
+    """
+    Split text by punctuation marks, keeping the punctuation as separate tokens.
+    
+    Args:
+        text (str): Input text to split
+        
+    Returns:
+        list: List of tokens with punctuation as separate items
+    """
     splits = [text]
     for punct in PUNCTS:
         for idx, t in enumerate(splits):
@@ -559,7 +749,21 @@ def split_puncts(text):
     return splits
 
 def tokenize(tokens, features, nonStringFeatureIndexList):
-
+    """
+    Convert preprocessed text into Token objects with phonemes.
+    This is the core tokenization function that:
+    1. Handles phoneme generation for each token
+    2. Processes special cases using features from preprocessing
+    3. Merges multi-word tokens appropriately
+    
+    Args:
+        tokens (list): List of token strings from preprocessing
+        features (dict): Special features indexed by token position
+        nonStringFeatureIndexList (list): Indices of non-string features
+        
+    Returns:
+        list: List of Token objects with phonetic information
+    """
     mutable_tokens = []
     for i, word in enumerate(tokens):
         if word in SUBTOKEN_JUNKS:
@@ -621,14 +825,20 @@ def tokenize(tokens, features, nonStringFeatureIndexList):
 
 def phonemize(text):
     """
-    Convert text to phonemes.
+    Main function to convert text to phonemes.
+    
+    The process follows these steps:
+    1. Preprocess text to handle special cases (currencies, times, numbers)
+    2. Tokenize the preprocessed text into Token objects
+    3. Resolve tokens to apply proper stress and formatting
     
     Args:
-        text: The input text to convert to phonemes.
-        language: The language code to use for phonemization.
+        text (str): The input text to convert to phonemes
     
     Returns:
-        The phonemized text and the tokens used for phonemization.
+        dict: Dictionary with:
+            - 'ps': Processed phoneme string with stress marks
+            - 'tokens': List of Token objects used for generation
     """
     _, tokens, features, nonStringFeatureIndexList = preprocess(text)
     tokens = tokenize(tokens, features, nonStringFeatureIndexList)   
@@ -637,5 +847,14 @@ def phonemize(text):
     return {"ps": result, "tokens": tokens}
 
 def set_lexicon(lexicon):
+    """
+    Set a custom lexicon for word-to-phoneme mappings.
+    
+    Args:
+        lexicon (dict): Dictionary mapping words to their phoneme representations
+    
+    Returns:
+        None: Updates the global LEXICON variable
+    """
     LEXICON = lexicon
     print("LEXICON Sample keys", list(LEXICON.keys())[:10])
